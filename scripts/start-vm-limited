@@ -1,0 +1,86 @@
+#!/usr/bin/bash
+# Start a reims-ctl macOS VM inside its own cgroup with a kernel-enforced VRAM ceiling.
+#
+#   pkexec /path/to/start-vm-limited [--vm tahoe] [--limit 4G] [--gpu drm/0000:2d:00.0/vram] [--dry-run]
+#
+# Why: reims-vgpu's QEMU can hold most of a GPU's VRAM. The dmem cgroup controller
+# caps it. Starting through this script also keeps QEMU out of whatever app or
+# terminal launched it, so closing that app cannot take the VM down with it.
+# Run as root via pkexec or sudo; reims-ctl itself runs as the invoking user.
+set -euo pipefail
+
+vm=tahoe limit=4G region="" dry_run=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --vm) vm=$2; shift 2 ;;
+        --limit) limit=$2; shift 2 ;;
+        --gpu) region=$2; shift 2 ;;
+        --dry-run) dry_run=1; shift ;;
+        -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+    esac
+done
+
+uid=${PKEXEC_UID:-${SUDO_UID:-}}
+if [[ $dry_run == 1 && -z $uid ]]; then uid=$(id -u); fi
+[[ -n $uid && $uid != 0 ]] || { echo "Run via pkexec or sudo from your normal user (or use --dry-run)." >&2; exit 1; }
+user=$(getent passwd "$uid" | cut -d: -f1)
+home=$(getent passwd "$uid" | cut -d: -f6)
+[[ $vm =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid VM name: $vm" >&2; exit 2; }
+
+case "$limit" in
+    *[Gg]) bytes=$(( ${limit%[Gg]} * 1024 * 1024 * 1024 )) ;;
+    *[Mm]) bytes=$(( ${limit%[Mm]} * 1024 * 1024 )) ;;
+    *[0-9]) bytes=$limit ;;
+    *) echo "--limit takes bytes or a number with M/G" >&2; exit 2 ;;
+esac
+
+capacity=/sys/fs/cgroup/dmem.capacity
+[[ -r $capacity ]] || { echo "This kernel has no dmem cgroup controller ($capacity missing)." >&2; exit 1; }
+if [[ -z $region ]]; then
+    mapfile -t regions < <(awk '$1 ~ /^drm\/.*\/vram$/ {print $1}' "$capacity")
+    [[ ${#regions[@]} -eq 1 ]] || { echo "Found ${#regions[@]} VRAM regions; pick one with --gpu:" >&2; cat "$capacity" >&2; exit 2; }
+    region=${regions[0]}
+fi
+grep -q "^$region " "$capacity" || { echo "No such dmem region: $region" >&2; exit 2; }
+
+reims=$home/.cargo/bin/reims-ctl
+pidfile=$home/.local/share/reims-ctl/vms/$vm/qemu.pid
+cg=/sys/fs/cgroup/macos-vm-$vm
+
+if [[ $dry_run == 1 ]]; then
+    printf 'user=%s vm=%s region=%s limit=%s bytes\ncgroup=%s\nwould run: runuser -u %s -- %s start %s\n' \
+        "$user" "$vm" "$region" "$bytes" "$cg" "$user" "$reims" "$vm"
+    exit 0
+fi
+[[ $EUID -eq 0 ]] || { echo "Run with pkexec or sudo." >&2; exit 1; }
+[[ -x $reims ]] || { echo "reims-ctl not found at $reims" >&2; exit 1; }
+
+if [[ -f $pidfile ]]; then
+    read -r existing <"$pidfile"
+    if [[ $existing =~ ^[0-9]+$ ]] && kill -0 "$existing" 2>/dev/null; then
+        echo "$vm is still running (pid $existing). Shut it down normally first; nothing was stopped." >&2
+        exit 1
+    fi
+fi
+
+[[ $(cat /sys/fs/cgroup/cgroup.controllers) == *dmem* ]] || { echo "dmem controller not available at the cgroup root." >&2; exit 1; }
+printf '+dmem\n' >/sys/fs/cgroup/cgroup.subtree_control
+mkdir -p "$cg"
+[[ -z $(cat "$cg/cgroup.procs") ]] || { echo "Cgroup $cg is already occupied." >&2; exit 1; }
+printf '%s %s\n' "$region" "$bytes" >"$cg/dmem.max"
+grep -qx "$region $bytes" "$cg/dmem.max"
+printf '%s\n' "$$" >"$cg/cgroup.procs"
+
+echo "Starting $vm with a ${limit} VRAM ceiling on $region."
+runuser -u "$user" -- env USER="$user" LOGNAME="$user" HOME="$home" \
+    PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+    XDG_RUNTIME_DIR="/run/user/$uid" XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}" \
+    WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" DISPLAY="${DISPLAY:-:0}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    "$reims" start "$vm"
+
+read -r pid <"$pidfile"
+grep -qx "0::/macos-vm-$vm" "/proc/$pid/cgroup" || { echo "WARNING: QEMU pid $pid is not in $cg" >&2; exit 1; }
+echo "QEMU pid $pid is in $cg. Limit and current use:"
+cat "$cg/dmem.max" "$cg/dmem.current"

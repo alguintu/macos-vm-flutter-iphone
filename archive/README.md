@@ -1,0 +1,3 @@
+# Archived: usbmux relay (did not work)
+
+`usbmux-relay.py` (guest, run with sudo) swapped macOS's `/var/run/usbmuxd` for a relay to Fedora's usbmuxd, exposed by `usbmux-relay.service` (socat on 127.0.0.1:27015; the guest reaches it as 10.0.2.2). Raw usbmux `ListDevices`, lockdown `GetValue` and pair-record reads all worked through it, but Xcode 26's CoreDevice reported `pairingState: unsupported` for the iOS 26 iPhone and never built its tunnel. Kept for reference only; the working approach is EHCI passthrough (see `../runbook.md`, section "iPhone"). Do not run it alongside passthrough: it replaces the socket Apple's usbmuxd needs.

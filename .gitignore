@@ -1,0 +1,11 @@
+# Never commit machine identity, signing material or VM images.
+*.qcow2
+*.img
+*.fd
+*.xip
+*.p12
+*.mobileprovision
+*identity*.json*
+**/config.plist
+*.log
+.DS_Store

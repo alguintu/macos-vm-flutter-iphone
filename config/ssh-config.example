@@ -1,0 +1,9 @@
+# Append to ~/.ssh/config on the host. Use a dedicated key for the VM:
+#   ssh-keygen -t ed25519 -N '' -f ~/.ssh/macos_vm
+# and put the public half in the guest's ~/.ssh/authorized_keys.
+Host tahoe
+    HostName 127.0.0.1
+    Port 2222
+    User <guest-user>
+    IdentityFile ~/.ssh/macos_vm
+    IdentitiesOnly yes

@@ -1,0 +1,47 @@
+# reims-ctl VM settings: ~/.local/share/reims-ctl/vms/<name>/vm.toml
+# Created by `reims-ctl create`, then edited by hand. Values in <angle brackets> are per machine.
+name = "tahoe"
+profile = "q35-x86_64"
+cpus = 16
+# 14 GiB fits Fedora's default vm.max_map_count (1048576); more needs a sysctl change.
+memory_mib = 14336
+disk = "/mnt/vms/macos/tahoe/macos.qcow2"
+disk_format = "qcow2"
+stop_timeout_secs = 90
+
+# iPhone passthrough: an emulated EHCI (USB 2) controller with the physical phone
+# forwarded onto it. hostbus/hostport come from `install-iphone-port.sh --list`
+# (bus number = the controller's USB 2 bus in `lsusb -t`). Reserve the same socket
+# from the host with install-iphone-port.sh.
+extra_args = ["-device", "usb-ehci,id=iphone_ehci,bus=pcie.0/pcie-root-port/pcie.0,addr=0x0", "-device", "usb-host,id=iphone,bus=iphone_ehci.0,port=1,hostbus=<bus>,hostport=<port>,vendorid=0x05ac,productid=0x12a8,guest-reset=off,pipeline=off"]
+
+[display]
+count = 1
+resolution = "1920x1080"
+hidpi = false
+borderless = false
+
+[gpu]
+
+[audio]
+enabled = true
+
+[network]
+enabled = true
+# Keep the MAC the OpenCore ROM value was derived from.
+mac = "<52:54:00:xx:xx:xx>"
+ssh_port = 2222
+
+[logs]
+enabled = true
+level = "info"
+
+[q35]
+opencore = "opencore.qcow2"
+opencore_format = "qcow2"
+firmware_code = "OVMF_CODE.fd"
+firmware_vars = "OVMF_VARS.fd"
+cpu_model = "Skylake-Client-noTSX-IBRS"
+cpu_flags = "+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check"
+# SATA port the disk occupied when macOS was installed (OSX-KVM installs used 4).
+disk_port = 4

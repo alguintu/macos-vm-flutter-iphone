@@ -1,0 +1,9 @@
+[Unit]
+Description=Relay Fedora's usbmuxd to the macOS VM (usbfluxd) on 127.0.0.1:27015
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:27015,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/var/run/usbmuxd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
