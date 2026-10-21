@@ -1,0 +1,10 @@
+{
+  "vm": "tahoe",
+  "qemu": "/home/YOUR_USER/Build/reims-multimonitor/qemu-build/qemu-system-x86_64",
+  "firmware_dir": "/home/YOUR_USER/.local/share/reims-ctl/qemu/current/share/qemu",
+  "opencore": "/mnt/vms/macos/tahoe/opencore-multimonitor.raw",
+  "socket_dir": "/home/YOUR_USER/.local/state/reims-pointer",
+  "snapshot_dir": "/mnt/vms/macos/input-test",
+  "modes": ["1920x1080@60", "720x1440@60", "1080x1920@60"],
+  "snapshot": true
+}

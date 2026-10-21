@@ -2,6 +2,8 @@
 
 Repeatable procedure for building, running and repairing the VM, written so another person or agent can pick it up cold. Everything here was performed and verified on the [reference machine](README.md#reference-machine-tested-2026-10-21) on 2026-10-21 unless marked otherwise. Read [Known failures](#known-failures) before improvising.
 
+**2026-10-22 follow-up:** the original procedure below is the single-display baseline. For the accepted dual-display mouse candidate use [multimonitor.md](docs/multimonitor.md); for automatic USB return on VM exit use [usb-lifecycle.md](docs/usb-lifecycle.md), which supersedes permanent reservation in section 7. The iPhone Simulator has since booted and displayed on the second monitor; full compatibility is still unverified.
+
 Conventions: **Host** = Fedora shell as your normal user. **Guest (SSH)** = `ssh tahoe '…'`. **Guest (desktop)** = Terminal.app in the VM window. Steps that need a password say whose: host sudo, Mac account, or Apple Account. Agents should hand password steps to the human in a terminal and never type them.
 
 Placeholders: `<vm>` VM name (examples use `tahoe`), `<vm-dir>` = `~/.local/share/reims-ctl/vms/<vm>`, `<storage>` VM drive (examples use `/mnt/vms`).

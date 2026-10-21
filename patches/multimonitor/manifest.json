@@ -1,0 +1,14 @@
+{
+  "reims_vgpu": {
+    "url": "https://github.com/steelbrain/reims-vgpu.git",
+    "revision": "2ce320931917e8a07a00243f53656f8cd11306b2",
+    "patch": "reims-vgpu.patch",
+    "patch_sha256": "50796032c590905c297a36d9f302d3fd7cf658e83813c91349d96ac05d392e36"
+  },
+  "qemu": {
+    "url": "https://github.com/steelbrain/qemu-reims-vgpu.git",
+    "revision": "bd95509aa307f48b13fe8497d8a1b64267cb4c3e",
+    "patch": "qemu.patch",
+    "patch_sha256": "d751283b7e2c1b827c8d6bd231e40b662b24fb08eb168a7c62f32cb73b994a71"
+  }
+}

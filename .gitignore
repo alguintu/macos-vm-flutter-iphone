@@ -9,3 +9,6 @@
 **/config.plist
 *.log
 .DS_Store
+*.raw
+__pycache__/
+*.pyc

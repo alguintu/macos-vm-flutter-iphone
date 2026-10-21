@@ -1,0 +1,3147 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c805d201643e8d31d56a829da80eb4cf22768f5e..001aa6643c3c9211e1e453a7ed08a59c5de01151 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -221,6 +221,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+ [[package]]
+ name = "metal2vulkan"
+ version = "0.2.0"
++source = "git+https://github.com/steelbrain/metal2vulkan?rev=62cad6be548f7ebe8d901fdc754edf20acaae1b9#62cad6be548f7ebe8d901fdc754edf20acaae1b9"
+ dependencies = [
+  "ash",
+  "metal2vulkan-air",
+@@ -231,6 +232,7 @@ dependencies = [
+ [[package]]
+ name = "metal2vulkan-air"
+ version = "0.2.0"
++source = "git+https://github.com/steelbrain/metal2vulkan?rev=62cad6be548f7ebe8d901fdc754edf20acaae1b9#62cad6be548f7ebe8d901fdc754edf20acaae1b9"
+ dependencies = [
+  "sha2",
+ ]
+@@ -238,6 +240,7 @@ dependencies = [
+ [[package]]
+ name = "metal2vulkan-runtime"
+ version = "0.2.0"
++source = "git+https://github.com/steelbrain/metal2vulkan?rev=62cad6be548f7ebe8d901fdc754edf20acaae1b9#62cad6be548f7ebe8d901fdc754edf20acaae1b9"
+ dependencies = [
+  "ash",
+  "libc",
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu.h b/crates/reims-vgpu-c/include/reims_vgpu.h
+index 52dbb2e11cafb14e46d039a6b095caab6d94c655..be2463aac6c6cb49331289c0f33dbd699edc357a 100644
+--- a/crates/reims-vgpu-c/include/reims_vgpu.h
++++ b/crates/reims-vgpu-c/include/reims_vgpu.h
+@@ -599,6 +599,13 @@ typedef struct {
+ // `wheel`.
+ typedef void (*RvgWindowScrollFn)(void *ctx, const RvgWindowScroll *scroll);
+ 
++// Relative host-point motion and button state while captured on Linux.
++// Supplying this callback opts into relative capture and guest software cursors.
++// The initial capture click uses `pointer`; later motion and button transitions
++// use this callback, with zero deltas for buttons. Other hosts ignore it.
++// Thread and lifetime: as RvgWindowPointerFn.
++typedef void (*RvgWindowRelativePointerFn)(void *ctx, double dx, double dy, uint32_t buttons);
++
+ // A window's callbacks.
+ typedef struct {
+   // sizeof(RvgWindowCallbacks) as the host was compiled.
+@@ -612,6 +619,7 @@ typedef struct {
+   RvgWindowKeyFn key;
+   RvgWindowCloseFn close;
+   RvgWindowScrollFn scroll;
++  RvgWindowRelativePointerFn relative_pointer;
+ } RvgWindowCallbacks;
+ 
+ // A display's window (RvgDisplayConfig's `window`).
+diff --git a/crates/reims-vgpu-c/src/window.rs b/crates/reims-vgpu-c/src/window.rs
+index 67ae9b9dca08ff5636a9586b8c83679834f53fb5..69441a5623e3d958f43b51fac2086fcc61d8faa7 100644
+--- a/crates/reims-vgpu-c/src/window.rs
++++ b/crates/reims-vgpu-c/src/window.rs
+@@ -9,8 +9,8 @@ use std::ffi::c_void;
+ use std::sync::Arc;
+ 
+ use reims_vgpu::{
+-    CloseFn, KeyFn, MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
+-    WindowCallbacks, WindowConfig,
++    CloseFn, KeyFn, MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn,
++    ScrollPhase, WheelFn, WindowCallbacks, WindowConfig,
+ };
+ 
+ use crate::ffi;
+@@ -62,6 +62,14 @@ pub type RvgWindowPointerFn = Option<
+     ),
+ >;
+ 
++/// Relative host-point motion and button state while captured on Linux.
++/// Supplying this callback opts into relative capture and guest software cursors.
++/// The initial capture click uses `pointer`; later motion and button transitions
++/// use this callback, with zero deltas for buttons. Other hosts ignore it.
++/// Thread and lifetime: as RvgWindowPointerFn.
++pub type RvgWindowRelativePointerFn =
++    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, dx: f64, dy: f64, buttons: u32)>;
++
+ /// `wheel(ctx, dy, dx)`: wheel notches. `dy` above 0 is the wheel turned away from the person
+ /// (up), `dx` above 0 is to the left: the device's own direction, whatever the host's scrolling
+ /// setting, so the guest's applies.
+@@ -170,6 +178,7 @@ pub struct RvgWindowCallbacks {
+     pub key: RvgWindowKeyFn,
+     pub close: RvgWindowCloseFn,
+     pub scroll: RvgWindowScrollFn,
++    pub relative_pointer: RvgWindowRelativePointerFn,
+ }
+ 
+ // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
+@@ -292,6 +301,16 @@ impl RvgWindowConfig {
+ /// with the table's `ctx`.
+ pub(crate) fn window_callbacks(t: &Arc<Table>, c: &RvgWindowCallbacks) -> WindowCallbacks {
+     WindowCallbacks {
++        relative_pointer: c.relative_pointer.map(|f| {
++            let t = t.clone();
++            let c: RelativePointerFn = Arc::new(move |dx, dy, buttons| {
++                // SAFETY: the host's function over its ctx.
++                ffi::host_call("relative_pointer", || unsafe {
++                    f(t.ctx(), dx, dy, buttons)
++                });
++            });
++            c
++        }),
+         pointer: c.pointer.map(|f| {
+             let t = t.clone();
+             let c: PointerFn = Arc::new(move |x, y, width, height, buttons| {
+diff --git a/crates/reims-vgpu-c/src/window/tests.rs b/crates/reims-vgpu-c/src/window/tests.rs
+index cf71b84d41d4b1aebe48d52f4452ee4c281c62fa..8e0125c6b294c44a9922e6450abec6f488f38e37 100644
+--- a/crates/reims-vgpu-c/src/window/tests.rs
++++ b/crates/reims-vgpu-c/src/window/tests.rs
+@@ -15,6 +15,26 @@ use crate::testkit::{Rec, Rig, t_destroy};
+ unsafe extern "C-unwind" fn t_pointer(ctx: *mut c_void, x: u16, y: u16, w: u16, h: u16, b: u32) {
+     Rec::push(ctx, format!("pointer {x},{y} in {w}x{h} buttons {b:#x}"));
+ }
++unsafe extern "C-unwind" fn t_relative(ctx: *mut c_void, dx: f64, dy: f64, buttons: u32) {
++    Rec::push(ctx, format!("relative {dx},{dy} buttons {buttons}"));
++}
++
++#[test]
++fn relative_callbacks_are_additive_and_forward_fractional_motion() {
++    let rec = Rec::new();
++    let t = Table::new(rec.ctx(), None);
++    let mut c = window_table(&rec);
++    c.relative_pointer = Some(t_relative);
++    c.struct_size = 64;
++    // SAFETY: a live callback table, declaring the old readable size.
++    let old = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
++    assert!(old.relative_pointer.is_none());
++    c.struct_size = sized::size_u32::<RvgWindowCallbacks>();
++    let callbacks = window_callbacks(&t, &c);
++    callbacks.relative_pointer.unwrap()(0.5, -2.25, 1);
++    assert_eq!(rec.lines(), ["relative 0.5,-2.25 buttons 1"]);
++}
++
+ unsafe extern "C-unwind" fn t_wheel(ctx: *mut c_void, dy: i32, dx: i32) {
+     Rec::push(ctx, format!("wheel {dy},{dx}"));
+ }
+@@ -53,6 +73,7 @@ fn window_table(rec: &Arc<Rec>) -> RvgWindowCallbacks {
+         key: Some(t_key),
+         close: Some(t_close),
+         scroll: Some(t_scroll),
++        relative_pointer: None,
+     }
+ }
+ 
+@@ -300,7 +321,11 @@ fn scroll_phases_are_their_constants() {
+ fn a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll() {
+     assert_eq!(<RvgWindowCallbacks as HostStruct>::V1_SIZE, 56);
+     assert_eq!(std::mem::offset_of!(RvgWindowCallbacks, scroll), 56);
+-    assert_eq!(size_of::<RvgWindowCallbacks>(), 64);
++    assert_eq!(size_of::<RvgWindowCallbacks>(), 72);
++    assert_eq!(
++        std::mem::offset_of!(RvgWindowCallbacks, relative_pointer),
++        64
++    );
+     let rec = Rec::new();
+     // A v1 table, followed in memory by a scroll callback it does not have.
+     let mut c = window_table(&rec);
+@@ -312,6 +337,7 @@ fn a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll() {
+     // SAFETY: as above.
+     let read = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
+     assert!(read.scroll.is_some());
++    assert!(read.relative_pointer.is_none());
+     c.struct_size = 55;
+     // SAFETY: as above.
+     assert_eq!(
+diff --git a/crates/reims-vgpu-core/src/device/mmio.rs b/crates/reims-vgpu-core/src/device/mmio.rs
+index 8f9d2de5a184babfa218dd3d788c18008942f4c9..a04f44c2af070c173911205862b2c4ead8924a1e 100644
+--- a/crates/reims-vgpu-core/src/device/mmio.rs
++++ b/crates/reims-vgpu-core/src/device/mmio.rs
+@@ -102,6 +102,22 @@ pub enum Register {
+     DisplayPortConnectionTypes = 0x8d,
+ }
+ 
++/// `REIMS_VGPU_EARLY_DISPLAY_PORTS=1` answers the host's display port count (0x122c) and
++/// connection types (0x1234) before the guest negotiates binary version 245. A guest whose
++/// framebuffer driver reads the port count once, before its GPU driver negotiates the version
++/// otherwise creates only one display. This override requires a guest that can drive multiple
++/// ports; it does not add that support. Unset or any value other than `1` keeps the default.
++fn early_display_ports() -> bool {
++    static EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *EARLY.get_or_init(|| {
++        early_display_ports_from_value(std::env::var_os("REIMS_VGPU_EARLY_DISPLAY_PORTS").as_deref())
++    })
++}
++
++fn early_display_ports_from_value(value: Option<&std::ffi::OsStr>) -> bool {
++    value.is_some_and(|v| v == "1")
++}
++
+ impl Register {
+     /// The register at `index`, if one is there.
+     pub fn decode(index: u16) -> Option<Register> {
+@@ -251,10 +267,14 @@ impl<P: Platform> DeviceCore<P> {
+ 
+     /// The display port count the guest reads.
+     ///
+-    /// Below version 245 every read answers `count != 0`.
++    /// Below version 245 every read answers `count != 0`, unless early display ports are enabled.
+     pub fn guest_display_port_count(&self) -> u32 {
++        self.guest_display_port_count_with_early_ports(early_display_ports())
++    }
++
++    fn guest_display_port_count_with_early_ports(&self, early_ports: bool) -> u32 {
+         let mut count = self.display_port_count.load(Ordering::Relaxed);
+-        if !self.features.load().supports_multiple_displays {
++        if !self.features.load().supports_multiple_displays && !early_ports {
+             count = u32::from(count != 0);
+             log::debug!("display port count reads {count}: the guest's version has one display");
+         }
+@@ -263,10 +283,14 @@ impl<P: Platform> DeviceCore<P> {
+ 
+     /// The display ports' connection types the guest reads.
+     ///
+-    /// Masked `& 3` below version 245.
++    /// Masked `& 3` below version 245, unless early display ports are enabled.
+     pub fn guest_display_port_connection_types(&self) -> u32 {
++        self.guest_display_port_connection_types_with_early_ports(early_display_ports())
++    }
++
++    fn guest_display_port_connection_types_with_early_ports(&self, early_ports: bool) -> u32 {
+         let types = self.display_port_connection_types.load(Ordering::Relaxed);
+-        if self.features.load().supports_multiple_displays {
++        if self.features.load().supports_multiple_displays || early_ports {
+             types
+         } else {
+             types & 3
+@@ -561,6 +585,70 @@ mod tests {
+         assert_eq!(r.device.mmio_read(0x1234), 0b1110);
+     }
+ 
++    #[test]
++    fn early_display_ports_requires_exact_opt_in() {
++        use std::ffi::OsStr;
++
++        assert!(!early_display_ports_from_value(None));
++        for value in ["", "0", "true", "yes", "on", " 1", "1 ", "2"] {
++            assert!(!early_display_ports_from_value(Some(OsStr::new(value))));
++        }
++        assert!(early_display_ports_from_value(Some(OsStr::new("1"))));
++    }
++
++    // Exercise both policies on the same device without changing the process environment.
++    #[test]
++    fn early_display_ports_exposes_all_ports_before_negotiation() {
++        let r = rig();
++        assert!(!r.device.features.load().supports_multiple_displays);
++        for (count, types) in [(0, 0), (1, 2), (3, 0b10_01_10)] {
++            r.device.display_port_count.store(count, Ordering::SeqCst);
++            r.device
++                .display_port_connection_types
++                .store(types, Ordering::SeqCst);
++            assert_eq!(r.device.guest_display_port_count_with_early_ports(true), count);
++            assert_eq!(
++                r.device.guest_display_port_connection_types_with_early_ports(true),
++                types
++            );
++            assert_eq!(
++                r.device.guest_display_port_count_with_early_ports(false),
++                u32::from(count != 0)
++            );
++            assert_eq!(
++                r.device.guest_display_port_connection_types_with_early_ports(false),
++                types & 3
++            );
++        }
++        // The override only changes these reads, not the negotiated version or features.
++        assert_eq!(r.device.mmio_read(0x1034), 0);
++        assert!(!r.device.features.load().supports_multiple_displays);
++    }
++
++    #[test]
++    fn early_display_ports_preserves_version_negotiation() {
++        let r = rig();
++        r.device.display_port_count.store(3, Ordering::SeqCst);
++        r.device
++            .display_port_connection_types
++            .store(0b10_01_10, Ordering::SeqCst);
++        for version in [238, 245, 238] {
++            r.device.mmio_write(Hold::NONE, 0x1034, version);
++            assert_eq!(r.device.mmio_read(0x1034), version);
++            for early in [false, true] {
++                let all_ports = early || version == 245;
++                assert_eq!(
++                    r.device.guest_display_port_count_with_early_ports(early),
++                    if all_ports { 3 } else { 1 }
++                );
++                assert_eq!(
++                    r.device.guest_display_port_connection_types_with_early_ports(early),
++                    if all_ports { 0b10_01_10 } else { 0b10 }
++                );
++            }
++        }
++    }
++
+     // EFI: every EFI register is stored and read back without an EFI display.
+     #[test]
+     fn efi_registers_stored_without_efi_display() {
+diff --git a/crates/reims-vgpu-window/Cargo.toml b/crates/reims-vgpu-window/Cargo.toml
+index d5ea7726a1fedd64d0138ae1e6616e8d9b8a1928..0253f736540486ad4a61f87b70c2e87d31acaeb5 100644
+--- a/crates/reims-vgpu-window/Cargo.toml
++++ b/crates/reims-vgpu-window/Cargo.toml
+@@ -17,7 +17,9 @@ ash.workspace = true
+ # Vulkan crate's threads.
+ [target.'cfg(target_os = "linux")'.dependencies]
+ reims-vgpu-vulkan.workspace = true
+-sdl3-sys.workspace = true
++# Wayland window surfaces use SDL's texture framebuffer; the local cursor child needs
++# the renderer subsystem even though the guest display itself renders through Vulkan.
++sdl3-sys = { workspace = true, features = ["sdl-render"] }
+ 
+ [features]
+ default = ["macos-sdl"]
+diff --git a/crates/reims-vgpu-window/features.md b/crates/reims-vgpu-window/features.md
+index b8cb804b2f94fb672f56b5c9535f82397d74b045..682c519245607beb0b7a62ea02ef61fce15f9f50 100644
+--- a/crates/reims-vgpu-window/features.md
++++ b/crates/reims-vgpu-window/features.md
+@@ -14,6 +14,35 @@ The sections up to "On Linux" are the macOS window's, AppKit's. "On Linux"
+ is the window on Linux, SDL3's on Wayland or X11, entry by entry against
+ them; its `manual` checks are on a Linux host's guest boot.
+ 
++## Experimental captured desktop input on Linux
++
++- Captured desktop motion uses the host acceleration curve; callers may override
++  it with `SDL_MOUSE_RELATIVE_SYSTEM_SCALE=0` for raw input. `manual`
++
++- A host supplying `relative_pointer` opts into SDL relative capture. The capture
++  click establishes an absolute position; later motion and button changes use
++  relative input, permitting one guest cursor to cross guest display boundaries
++  while keyboard focus stays with the capturing host window. Release and focus
++  loss lift held buttons. Other hosts ignore this callback.
++  `test: native::linux::input::relative_capture_preserves_motion_buttons_and_release`
++- Without a host-cursor layout socket, cursor capabilities are disabled so the
++  guest draws its own cursor in the framebuffer; the host cursor is hidden over
++  the image. Software cursor fallback and physical border crossing need a guest
++  boot check. `manual`
++
++- `REIMS_VGPU_HOST_CURSOR_SOCKET` opts into a local cursor prototype. The private
++  stream receives the companion's display bounds. Captured motion follows that
++  arrangement, scaled by the destination window's image; pointer coordinates and
++  local cursor placement use the same wire quantization.
++  `test: native::linux::desktop_pointer::displayed_coordinates_match_wire_quantization`
++- Local routing crosses touching guest bounds and slides along walls without
++  jumping gaps. `test: native::linux::desktop_pointer::gaps_stop_and_walls_slide`
++- The local cursor uses a transparent, noninteractive SDL child surface, separate
++  from guest Vulkan frames. Guest cursor capabilities remain enabled. Transport
++  loss or a changed layout releases capture and held input. Visibility, cursor
++  shapes, click alignment, resize scaling and physical latency require a VM boot.
++  This is an unaccepted prototype. `manual`
++
+ ## Switches
+ 
+ | variable | effect |
+diff --git a/crates/reims-vgpu-window/src/config.rs b/crates/reims-vgpu-window/src/config.rs
+index eb60b3944e7e293606afe66db29ff7a8786d57a1..386dd27929bf65012af66aa1daa5cf6165a308ba 100644
+--- a/crates/reims-vgpu-window/src/config.rs
++++ b/crates/reims-vgpu-window/src/config.rs
+@@ -21,10 +21,13 @@ pub const BUTTON_SIDE: u32 = 1 << 3;
+ /// The second side button (the host's fifth, "forward").
+ pub const BUTTON_EXTRA: u32 = 1 << 4;
+ 
+-/// `(x, y, width, height, buttons)`: the pointer is at `(x, y)` in the guest's pixels, in a
+-/// mode `width` by `height`, with the `BUTTON_*` bits of the buttons held. `x` is below `width`
+-/// and `y` below `height`: a pointer outside the image holds at its nearest edge.
++/// `(x, y, width, height, buttons)`: the pointer in guest pixels, clamped to its image.
+ pub type PointerFn = Arc<dyn Fn(u16, u16, u16, u16, u32) + Send + Sync>;
++/// `(dx, dy, buttons)`: relative host-point motion while captured on Linux.
++/// Providing this callback opts into relative capture. The experimental host-cursor socket
++/// selects local drawing/routing; otherwise the guest renders the cursor.
++/// The capture click still uses `pointer` to establish the initial position.
++pub type RelativePointerFn = Arc<dyn Fn(f64, f64, u32) + Send + Sync>;
+ /// `(dy, dx)`: wheel notches. `dy` above 0 is the wheel turned away from the person (up), `dx`
+ /// above 0 is to the left: the device's own direction, so the guest's scrolling setting applies.
+ pub type WheelFn = Arc<dyn Fn(i32, i32) + Send + Sync>;
+@@ -102,6 +105,8 @@ pub struct WindowCallbacks {
+     /// The wheel or a trackpad scrolled, smoothly and as notches. With it, scrolling comes here
+     /// and not to `wheel`.
+     pub scroll: Option<ScrollFn>,
++    /// Relative captured input on Linux; ignored on other hosts.
++    pub relative_pointer: Option<RelativePointerFn>,
+ }
+ 
+ impl std::fmt::Debug for WindowCallbacks {
+@@ -112,6 +117,7 @@ impl std::fmt::Debug for WindowCallbacks {
+             .field("key", &self.key.is_some())
+             .field("close", &self.close.is_some())
+             .field("scroll", &self.scroll.is_some())
++            .field("relative_pointer", &self.relative_pointer.is_some())
+             .finish()
+     }
+ }
+diff --git a/crates/reims-vgpu-window/src/lib.rs b/crates/reims-vgpu-window/src/lib.rs
+index 8dc757280197d2d9b73736117dab7cacb4adffc7..3803f2854d3e08e039c8546c91889b95b235e43a 100644
+--- a/crates/reims-vgpu-window/src/lib.rs
++++ b/crates/reims-vgpu-window/src/lib.rs
+@@ -61,8 +61,8 @@ mod sdl;
+ 
+ pub use config::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+-    MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
+-    WindowConfig,
++    MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
++    WindowCallbacks, WindowConfig,
+ };
+ pub use handle::{FrameSink, PixelRect, Window};
+ pub use policy::{Density, OfferedMode};
+@@ -71,3 +71,9 @@ pub use screens::HostScreen;
+ 
+ #[cfg(test)]
+ mod features;
++
++/// Whether the experimental Linux host cursor was explicitly configured.
++#[cfg(target_os = "linux")]
++pub fn host_cursor_enabled() -> bool {
++    native::desktop_pointer::enabled()
++}
+diff --git a/crates/reims-vgpu-window/src/native.rs b/crates/reims-vgpu-window/src/native.rs
+index bd31ea8d808532abb2ad78849898ecdc49a3dade..228e3d43e24b203fd33d135ee4957253905254db 100644
+--- a/crates/reims-vgpu-window/src/native.rs
++++ b/crates/reims-vgpu-window/src/native.rs
+@@ -32,3 +32,6 @@ pub(crate) use macos::{
+     key_input_captured, launched, monitored_events, open, quit_requested, release_key_input,
+     screens_changed,
+ };
++
++#[cfg(target_os = "linux")]
++pub(crate) use linux::desktop_pointer;
+diff --git a/crates/reims-vgpu-window/src/native/linux.rs b/crates/reims-vgpu-window/src/native/linux.rs
+index f4520d0496421586a257265dd45eededb41bc2b9..62a7091fa902e01583806d3195002d6426f4daf5 100644
+--- a/crates/reims-vgpu-window/src/native/linux.rs
++++ b/crates/reims-vgpu-window/src/native/linux.rs
+@@ -6,6 +6,7 @@
+ //! asks of it: what draws into the window ([`FrameSink`]), the window's opening, changes and end,
+ //! posted to the UI thread, and the host's screens as SDL lists them.
+ 
++pub(crate) mod desktop_pointer;
+ mod input;
+ mod keymap;
+ mod render;
+diff --git a/crates/reims-vgpu-window/src/native/linux/desktop_pointer.rs b/crates/reims-vgpu-window/src/native/linux/desktop_pointer.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdfcdf17083d7b094edea6cc3691033b0ff6a245
+--- /dev/null
++++ b/crates/reims-vgpu-window/src/native/linux/desktop_pointer.rs
+@@ -0,0 +1,836 @@
++//! Opt-in local cursor and absolute routing across the companion's guest desktop.
++//!
++//! The UI thread owns all state and SDL objects. A bounded local stream carries only display
++//! bounds, never pointer motion. Mouse events update the local position and the coordinates sent
++//! to the guest together; cursor movement does not wait for a guest frame or acknowledgement.
++use std::cell::RefCell;
++use std::collections::BTreeMap;
++use std::io::{BufRead, BufReader, Read};
++use std::os::unix::fs::PermissionsExt;
++use std::os::unix::net::UnixListener;
++use std::sync::{Arc, OnceLock, Weak};
++
++use sdl3_sys::everything::*;
++
++use super::input::{self, ToHost};
++use crate::geometry::Rect;
++use crate::handle::{Glyph, Window};
++
++/// An explicit private socket path opts into this experimental path.
++pub fn enabled() -> bool {
++    std::env::var_os("REIMS_VGPU_HOST_CURSOR_SOCKET").is_some()
++}
++
++#[derive(Clone, Debug, PartialEq)]
++struct Monitor {
++    head: u64,
++    bounds: Rect,
++}
++
++/// Strict, bounded layout frames: L 1 COUNT followed by HEAD X Y WIDTH HEIGHT per display.
++fn parse_layout(line: &str) -> Option<Vec<Monitor>> {
++    if line.len() > 4096 || !line.ends_with('\n') {
++        return None;
++    }
++    let words: Vec<_> = line.split_whitespace().collect();
++    if words.len() < 3 || words[0..2] != ["L", "1"] {
++        return None;
++    }
++    let count: usize = words[2].parse().ok()?;
++    if !(1..=16).contains(&count) || words.len() != 3 + 5 * count {
++        return None;
++    }
++    let mut map = Vec::new();
++    for row in words[3..].chunks_exact(5) {
++        let head: u64 = row[0].parse().ok()?;
++        let mut v = [0.0_f64; 4];
++        for (to, from) in v.iter_mut().zip(&row[1..]) {
++            *to = from.parse().ok()?;
++        }
++        if head >= 16
++            || map.iter().any(|m: &Monitor| m.head == head)
++            || v.iter().any(|n| !n.is_finite() || n.abs() > 1_000_000.0)
++            || v[2] < 1.0
++            || v[3] < 1.0
++        {
++            return None;
++        }
++        map.push(Monitor {
++            head,
++            bounds: Rect {
++                x: v[0],
++                y: v[1],
++                width: v[2],
++                height: v[3],
++            },
++        });
++    }
++    Some(map)
++}
++
++/// Sweep the motion segment through touching rectangles, then slide along an exterior wall.
++/// This matches the companion's relative geometry, including gaps and negative origins.
++fn advance(map: &[Monitor], point: (f64, f64), delta: (f64, f64)) -> Option<(u64, (f64, f64))> {
++    fn sweep(map: &[Monitor], p: (f64, f64), d: (f64, f64)) -> ((f64, f64), f64) {
++        let mut intervals = Vec::new();
++        for m in map {
++            let b = m.bounds;
++            let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
++            for (p, d, low, high) in [
++                (p.0, d.0, b.x, b.x + b.width),
++                (p.1, d.1, b.y, b.y + b.height),
++            ] {
++                if d == 0.0 {
++                    if p < low || p > high {
++                        hi = -1.0;
++                        break;
++                    }
++                } else {
++                    let a = (low - p) / d;
++                    let b = (high - p) / d;
++                    lo = lo.max(a.min(b));
++                    hi = hi.min(a.max(b));
++                }
++            }
++            if lo <= hi {
++                intervals.push((lo, hi));
++            }
++        }
++        intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
++        let mut end = 0.0_f64;
++        for (lo, hi) in intervals {
++            if lo > end + 1e-9 {
++                break;
++            }
++            end = end.max(hi);
++        }
++        ((p.0 + d.0 * end, p.1 + d.1 * end), end)
++    }
++    if map.is_empty()
++        || ![point.0, point.1, delta.0, delta.1]
++            .iter()
++            .all(|v| v.is_finite())
++    {
++        return None;
++    }
++    let (mut reached, t) = sweep(map, point, delta);
++    if t < 1.0 {
++        let a = sweep(map, reached, (delta.0 * (1.0 - t), 0.0)).0;
++        let b = sweep(map, reached, (0.0, delta.1 * (1.0 - t))).0;
++        reached = if (a.0 - reached.0).hypot(a.1 - reached.1)
++            >= (b.0 - reached.0).hypot(b.1 - reached.1)
++        {
++            a
++        } else {
++            b
++        };
++    }
++    map.iter()
++        .map(|m| {
++            let b = m.bounds;
++            let p = (
++                reached.0.clamp(b.x, (b.x + b.width).next_down()),
++                reached.1.clamp(b.y, (b.y + b.height).next_down()),
++            );
++            (m.head, p)
++        })
++        .min_by(|a, b| {
++            (a.1.0 - reached.0)
++                .hypot(a.1.1 - reached.1)
++                .total_cmp(&(b.1.0 - reached.0).hypot(b.1.1 - reached.1))
++        })
++}
++
++/// Quantize through the existing QEMU absolute callback. The overlay uses the same normalized
++/// integer coordinate the guest receives, including QEMU's inclusive range conversion.
++fn encode(bounds: Rect, point: (f64, f64)) -> ((u16, u16), (f64, f64)) {
++    let axis = |p: f64, origin: f64, size: f64| {
++        let n = if size <= 1.0 {
++            0
++        } else {
++            ((p - origin) / (size - 1.0) * 32767.0)
++                .round()
++                .clamp(0.0, 32766.0) as u16
++        };
++        // floor((n+1)*32767/32768) == n for n in 0..32766.
++        (n + 1, origin + f64::from(n) * (size - 1.0) / 32767.0)
++    };
++    let (x, px) = axis(point.0, bounds.x, bounds.width);
++    let (y, py) = axis(point.1, bounds.y, bounds.height);
++    ((x, y), (px, py))
++}
++
++struct View {
++    window: Weak<Window>,
++    parent: *mut SDL_Window,
++    image: Rect,
++    glyph: Option<Arc<Glyph>>,
++    visible: bool,
++    overlay: Option<Overlay>,
++    overlay_failed: bool,
++}
++
++#[derive(Default)]
++struct Desktop {
++    views: BTreeMap<u64, View>,
++    map: Vec<Monitor>,
++    point: Option<(u64, (f64, f64))>,
++    drawn: Option<(u64, (f64, f64))>,
++    captured: Option<u64>,
++    dirty: bool,
++    glyph: Option<Arc<Glyph>>,
++}
++
++thread_local! { static DESKTOP: RefCell<Desktop> = RefCell::new(Desktop::default()); }
++
++fn start() {
++    static STARTED: OnceLock<()> = OnceLock::new();
++    STARTED.get_or_init(|| {
++        let Some(path) = std::env::var_os("REIMS_VGPU_HOST_CURSOR_SOCKET") else {
++            return;
++        };
++        let listener = match UnixListener::bind(&path) {
++            Ok(l) => l,
++            Err(e) => {
++                log::error!("local cursor layout socket: {e}");
++                return;
++            }
++        };
++        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
++            log::error!("local cursor socket permissions: {e}");
++            return;
++        }
++        let _ = std::thread::Builder::new()
++            .name("reims-cursor-map".into())
++            .spawn(move || {
++                for stream in listener.incoming().flatten() {
++                    let mut input = BufReader::new(stream);
++                    loop {
++                        let mut line = String::new();
++                        if input
++                            .by_ref()
++                            .take(4097)
++                            .read_line(&mut line)
++                            .ok()
++                            .unwrap_or(0)
++                            == 0
++                        {
++                            break;
++                        }
++                        let Some(map) = parse_layout(&line) else {
++                            break;
++                        };
++                        super::ui::post(move || replace_layout(map));
++                    }
++                    super::ui::post(|| replace_layout(Vec::new()));
++                }
++            });
++    });
++}
++
++/// A changed arrangement or lost companion releases capture before using another geometry.
++fn replace_layout(map: Vec<Monitor>) {
++    let capture = DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        if d.map == map {
++            return None;
++        }
++        d.release();
++        let id = d
++            .captured
++            .and_then(|head| d.views.get(&head))
++            .and_then(|v| v.window.upgrade())
++            .map(|w| w.id());
++        d.map = map;
++        d.point = None;
++        d.drawn = None;
++        d.captured = None;
++        d.hide();
++        log::info!(
++            "local cursor: {} guest display bounds received",
++            d.map.len()
++        );
++        id
++    });
++    if let Some(id) = capture {
++        crate::sdl::shell::with_shell(id, |shell| {
++            shell.input.closing();
++            shell.flush();
++            shell.capture_changed();
++        });
++    }
++}
++
++/// Register/update a live SDL parent and its image rectangle, only on SDL's UI thread.
++pub(crate) fn register(window: &Arc<Window>, parent: *mut SDL_Window, image: Rect) {
++    if !enabled() {
++        return;
++    }
++    start();
++    let guest = window.guest();
++    let glyph = guest.cursor.map(Arc::new);
++    DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        let view = d.views.entry(window.port()).or_insert_with(|| View {
++            window: Arc::downgrade(window),
++            parent,
++            image,
++            glyph: glyph.clone(),
++            visible: guest.cursor_visible,
++            overlay: None,
++            overlay_failed: false,
++        });
++        view.image = image;
++        if d.glyph.is_none() {
++            d.glyph = glyph;
++        }
++        d.dirty = true;
++    });
++}
++
++/// Destroy the child before SDL destroys its parent.
++pub(crate) fn remove(head: u64) {
++    if !enabled() {
++        return;
++    }
++    DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        d.release();
++        d.views.remove(&head);
++        d.point = None;
++        d.drawn = None;
++        d.hide();
++    });
++}
++
++pub(crate) fn capture(head: u64, captured: bool) {
++    if !enabled() {
++        return;
++    }
++    DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        if captured {
++            d.captured = Some(head);
++            d.dirty = true;
++        } else if d.captured == Some(head) {
++            d.captured = None;
++            d.hide();
++        }
++    });
++}
++
++/// The most recent guest glyph is available immediately when the pointer crosses a head whose
++/// cursor shape has not changed. Cursor shape feedback remains asynchronous, as for native SDL.
++pub(crate) fn glyph(window: &Window) {
++    if !enabled() {
++        return;
++    }
++    let guest = window.guest();
++    DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        let Some(view) = d.views.get_mut(&window.port()) else {
++            return;
++        };
++        view.visible = guest.cursor_visible;
++        if let Some(g) = guest.cursor {
++            if view.glyph.as_deref() != Some(&g) {
++                view.glyph = Some(Arc::new(g));
++            }
++            d.glyph = view.glyph.clone();
++        }
++        d.dirty = true;
++    });
++}
++
++/// Route pointer/button coordinates locally; keys continue to the capturing window.
++pub(crate) fn send(window: &Window, events: Vec<ToHost>) {
++    DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        for event in events {
++            match event {
++                ToHost::Pointer { at, mode, buttons } => {
++                    let Some(m) = d.map.iter().find(|m| m.head == window.port()) else {
++                        continue;
++                    };
++                    let b = m.bounds;
++                    let nx = u32::from(at.0) * 32767 / u32::from(mode.0.max(1));
++                    let ny = u32::from(at.1) * 32767 / u32::from(mode.1.max(1));
++                    d.point = Some((
++                        window.port(),
++                        (
++                            b.x + f64::from(nx) * (b.width - 1.0) / 32767.0,
++                            b.y + f64::from(ny) * (b.height - 1.0) / 32767.0,
++                        ),
++                    ));
++                    d.emit(buttons);
++                }
++                ToHost::Relative { dx, dy, buttons } => {
++                    let Some((head, p)) = d.point else {
++                        continue;
++                    };
++                    let Some(m) = d.map.iter().find(|m| m.head == head) else {
++                        continue;
++                    };
++                    let Some(view) = d.views.get(&head) else {
++                        continue;
++                    };
++                    if view.image.width <= 0.0 || view.image.height <= 0.0 {
++                        continue;
++                    }
++                    let delta = (
++                        dx * m.bounds.width / view.image.width,
++                        dy * m.bounds.height / view.image.height,
++                    );
++                    d.point = advance(&d.map, p, delta);
++                    d.emit(buttons);
++                }
++                ToHost::Wheel { .. } => {
++                    let head = if d.captured.is_some() {
++                        d.point.map(|p| p.0).unwrap_or(window.port())
++                    } else {
++                        window.port()
++                    };
++                    if let Some(w) = d.views.get(&head).and_then(|v| v.window.upgrade())
++                        && let Some(cb) = w.callbacks()
++                    {
++                        input::send(&cb, vec![event]);
++                    }
++                }
++                ToHost::Key(_) => {
++                    if let Some(cb) = window.callbacks() {
++                        input::send(&cb, vec![event]);
++                    }
++                }
++            }
++        }
++    });
++}
++
++impl Desktop {
++    fn emit(&mut self, buttons: u32) {
++        let Some((head, p)) = self.point else {
++            return;
++        };
++        let Some(m) = self.map.iter().find(|m| m.head == head) else {
++            return;
++        };
++        let Some(w) = self.views.get(&head).and_then(|v| v.window.upgrade()) else {
++            return;
++        };
++        let Some(cb) = w.callbacks().and_then(|c| c.pointer) else {
++            return;
++        };
++        let (at, shown) = encode(m.bounds, p);
++        cb(at.0, at.1, 32768, 32768, buttons);
++        self.drawn = Some((head, shown));
++        self.dirty = true;
++    }
++    fn release(&mut self) {
++        self.emit(0);
++    }
++    fn hide(&mut self) {
++        for view in self.views.values_mut() {
++            if let Some(o) = &mut view.overlay {
++                o.hide();
++            }
++        }
++    }
++    fn render(&mut self) {
++        if !self.dirty {
++            return;
++        }
++        self.dirty = false;
++        let visible = self.views.values().any(|v| v.visible);
++        let Some((head, point)) = self.drawn.filter(|_| self.captured.is_some() && visible) else {
++            self.hide();
++            return;
++        };
++        let Some(m) = self.map.iter().find(|m| m.head == head) else {
++            self.hide();
++            return;
++        };
++        let b = m.bounds;
++        let glyph = &self.glyph;
++        for (&h, view) in &mut self.views {
++            if h != head {
++                if let Some(o) = &mut view.overlay {
++                    o.hide();
++                }
++                continue;
++            }
++            let Some(g) = view.glyph.as_ref().or(glyph.as_ref()) else {
++                continue;
++            };
++            let position = (
++                view.image.x + (point.0 - b.x) * view.image.width / b.width,
++                view.image.y + (point.1 - b.y) * view.image.height / b.height,
++            );
++            if view.overlay.is_none() && !view.overlay_failed {
++                view.overlay = Overlay::new(view.parent);
++                view.overlay_failed = view.overlay.is_none();
++            }
++            if let Some(o) = &mut view.overlay {
++                if view.overlay_failed {
++                    continue;
++                }
++                let mode = view
++                    .window
++                    .upgrade()
++                    .and_then(|w| w.mode())
++                    .unwrap_or((1, 1));
++                let scale = view.image.width / f64::from(mode.0.max(1));
++                o.show(g, position, scale);
++                view.overlay_failed = o.failed;
++            }
++        }
++    }
++}
++
++/// Called after SDL input batches AND UI jobs, including frames arriving on an idle desktop.
++pub(crate) fn render() {
++    if !enabled() {
++        return;
++    }
++    let failed_capture = DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        d.render();
++        if d.captured.is_some() && d.views.values().any(|v| v.overlay_failed) {
++            let id = d
++                .captured
++                .and_then(|head| d.views.get(&head))
++                .and_then(|v| v.window.upgrade())
++                .map(|w| w.id());
++            d.release();
++            d.captured = None;
++            d.hide();
++            id
++        } else {
++            None
++        }
++    });
++    if let Some(id) = failed_capture {
++        crate::sdl::shell::with_shell(id, |shell| {
++            shell.input.closing();
++            shell.flush();
++            shell.capture_changed();
++        });
++    }
++}
++
++/// Handle redraws of our child surfaces after an asynchronous compositor resize/exposure.
++pub(crate) fn event(event: &SDL_Event) -> bool {
++    if !enabled() {
++        return false;
++    }
++    // SAFETY: SDL window events share SDL_WindowEvent's type/id layout.
++    let kind = unsafe { event.r#type };
++    if !(SDL_EVENT_WINDOW_FIRST.0..=SDL_EVENT_WINDOW_LAST.0).contains(&kind) {
++        return false;
++    }
++    let id = unsafe { event.window.windowID };
++    DESKTOP.with(|d| {
++        let mut d = d.borrow_mut();
++        for view in d.views.values_mut() {
++            if let Some(o) = &mut view.overlay {
++                // SAFETY: the live child, on SDL's UI thread.
++                if unsafe { SDL_GetWindowID(o.window) } == id {
++                    if [
++                        SDL_EVENT_WINDOW_EXPOSED.0,
++                        SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED.0,
++                    ]
++                    .contains(&kind)
++                    {
++                        o.glyph = None;
++                        d.dirty = true;
++                    }
++                    return true;
++                }
++            }
++        }
++        false
++    })
++}
++
++/// A transparent, noninteractive SDL child. It is separate from the VM's Vulkan swapchain;
++/// moving it or replacing its tiny image never requests a new guest/display frame.
++struct Overlay {
++    window: *mut SDL_Window,
++    glyph: Option<Arc<Glyph>>,
++    scale: f64,
++    visible: bool,
++    position: Option<(i32, i32)>,
++    size: (i32, i32),
++    failed: bool,
++}
++impl Overlay {
++    fn new(parent: *mut SDL_Window) -> Option<Self> {
++        // SAFETY: all SDL handles are created, used and destroyed on SDL's UI thread.
++        unsafe {
++            let props = SDL_CreateProperties();
++            SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_PARENT_POINTER, parent.cast());
++            SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_TOOLTIP_BOOLEAN, true);
++            SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_TRANSPARENT_BOOLEAN, true);
++            SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
++            SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_CONSTRAIN_POPUP_BOOLEAN, false);
++            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, 32);
++            SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, 32);
++            let window = SDL_CreateWindowWithProperties(props);
++            SDL_DestroyProperties(props);
++            if window.is_null() {
++                log::error!("local cursor overlay: {}", crate::sdl::sdl_error());
++                return None;
++            }
++            log::info!("local cursor: transparent SDL child created");
++            Some(Self {
++                window,
++                glyph: None,
++                scale: 0.0,
++                visible: false,
++                position: None,
++                size: (32, 32),
++                failed: false,
++            })
++        }
++    }
++    fn hide(&mut self) {
++        if self.visible {
++            unsafe {
++                SDL_HideWindow(self.window);
++            }
++            self.visible = false;
++        }
++    }
++    fn show(&mut self, glyph: &Arc<Glyph>, point: (f64, f64), scale: f64) {
++        if glyph.width == 0
++            || glyph.height == 0
++            || glyph.width > 256
++            || glyph.height > 256
++            || glyph.rgba.len() != glyph.width as usize * glyph.height as usize * 4
++            || !scale.is_finite()
++            || scale <= 0.0
++        {
++            self.hide();
++            return;
++        }
++        let width = (f64::from(glyph.width) * scale).round().clamp(1.0, 512.0) as i32;
++        let height = (f64::from(glyph.height) * scale).round().clamp(1.0, 512.0) as i32;
++        // SAFETY: SDL's UI thread; glyph bytes remain alive until the synchronous blit ends.
++        unsafe {
++            let position = (
++                (point.0 - f64::from(glyph.hot_spot.0) * scale).round() as i32,
++                (point.1 - f64::from(glyph.hot_spot.1) * scale).round() as i32,
++            );
++            if self.position != Some(position) {
++                SDL_SetWindowPosition(self.window, position.0, position.1);
++                self.position = Some(position);
++            }
++            if !self.glyph.as_ref().is_some_and(|g| Arc::ptr_eq(g, glyph))
++                || self.scale != scale
++                || !self.visible
++            {
++                if self.size != (width, height) {
++                    SDL_SetWindowSize(self.window, width, height);
++                    self.size = (width, height);
++                }
++                if !self.visible {
++                    SDL_ShowWindow(self.window);
++                    self.visible = true;
++                }
++                let dest = SDL_GetWindowSurface(self.window);
++                if dest.is_null() {
++                    log::error!("local cursor surface: {}", crate::sdl::sdl_error());
++                    self.failed = true;
++                    self.hide();
++                    return;
++                }
++                SDL_SetWindowSurfaceVSync(self.window, 0);
++                SDL_FillSurfaceRect(dest, std::ptr::null(), 0);
++                let source = SDL_CreateSurfaceFrom(
++                    glyph.width as i32,
++                    glyph.height as i32,
++                    SDL_PIXELFORMAT_RGBA32,
++                    glyph.rgba.as_ptr().cast_mut().cast(),
++                    glyph.width as i32 * 4,
++                );
++                if !source.is_null() {
++                    SDL_SetSurfaceBlendMode(source, SDL_BLENDMODE_NONE);
++                    SDL_BlitSurfaceScaled(
++                        source,
++                        std::ptr::null(),
++                        dest,
++                        std::ptr::null(),
++                        SDL_SCALEMODE_NEAREST,
++                    );
++                    SDL_DestroySurface(source);
++                    if !SDL_UpdateWindowSurface(self.window) {
++                        log::error!("local cursor update: {}", crate::sdl::sdl_error());
++                        self.failed = true;
++                    }
++                } else {
++                    log::error!("local cursor image: {}", crate::sdl::sdl_error());
++                    self.failed = true;
++                }
++                self.glyph = Some(glyph.clone());
++                self.scale = scale;
++            }
++        }
++    }
++}
++impl Drop for Overlay {
++    fn drop(&mut self) {
++        unsafe {
++            SDL_DestroyWindow(self.window);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn map() -> Vec<Monitor> {
++        parse_layout("L 1 2 0 0 0 1920 1080 1 1920 0 720 1440\n").unwrap()
++    }
++    #[test]
++    fn crosses_and_returns_without_losing_distance() {
++        let m = map();
++        let a = advance(&m, (1879.0, 540.0), (80.0, 0.0)).unwrap();
++        assert_eq!(a, (1, (1959.0, 540.0)));
++        assert_eq!(advance(&m, a.1, (-80.0, 0.0)), Some((0, (1879.0, 540.0))));
++    }
++    #[test]
++    fn gaps_stop_and_walls_slide() {
++        let mut m = map();
++        m[1].bounds.x = 2000.0;
++        assert_eq!(
++            advance(&m, (1900.0, 500.0), (150.0, 60.0)),
++            Some((0, (1920.0_f64.next_down(), 560.0)))
++        );
++        assert_eq!(
++            advance(&map(), (1900.0, 1070.0), (100.0, 100.0)),
++            Some((1, (2000.0, 1080.0)))
++        );
++    }
++    #[test]
++    fn fractional_motion_can_cross_a_border() {
++        let m = map();
++        let mut p = (1919.0, 540.0);
++        let mut head = 0;
++        for _ in 0..8 {
++            (head, p) = advance(&m, p, (0.25, 0.0)).unwrap();
++        }
++        assert_eq!((head, p), (1, (1921.0, 540.0)));
++    }
++    #[test]
++    fn routed_drag_and_release_follow_destination_and_window_scale() {
++        use crate::config::{WindowCallbacks, WindowConfig};
++        use std::sync::Mutex;
++        let events = Arc::new(Mutex::new(Vec::new()));
++        let windows: Vec<_> = (0..2)
++            .map(|head| {
++                let events = events.clone();
++                Window::new(
++                    WindowConfig {
++                        callbacks: WindowCallbacks {
++                            pointer: Some(Arc::new(move |x, y, w, h, buttons| {
++                                events.lock().unwrap().push((head, x, y, w, h, buttons))
++                            })),
++                            ..WindowCallbacks::default()
++                        },
++                        ..WindowConfig::default()
++                    },
++                    head,
++                    String::new(),
++                )
++            })
++            .collect();
++        DESKTOP.with(|d| {
++            let mut d = d.borrow_mut();
++            *d = Desktop {
++                map: map(),
++                ..Desktop::default()
++            };
++            for w in &windows {
++                d.views.insert(
++                    w.port(),
++                    View {
++                        window: Arc::downgrade(w),
++                        parent: std::ptr::null_mut(),
++                        image: Rect {
++                            x: 0.0,
++                            y: 0.0,
++                            width: if w.port() == 0 { 960.0 } else { 360.0 },
++                            height: if w.port() == 0 { 540.0 } else { 720.0 },
++                        },
++                        glyph: None,
++                        visible: false,
++                        overlay: None,
++                        overlay_failed: false,
++                    },
++                );
++            }
++            d.point = Some((0, (1879.0, 540.0)));
++            d.captured = Some(0);
++        });
++        send(
++            &windows[0],
++            vec![ToHost::Relative {
++                dx: 40.0,
++                dy: 0.0,
++                buttons: 1,
++            }],
++        );
++        DESKTOP.with(|d| assert_eq!(d.borrow().point, Some((1, (1959.0, 540.0)))));
++        send(
++            &windows[0],
++            vec![ToHost::Relative {
++                dx: 0.0,
++                dy: 0.0,
++                buttons: 0,
++            }],
++        );
++        let recorded = events.lock().unwrap().clone();
++        assert_eq!(recorded.len(), 2);
++        assert_eq!(recorded[0].0, 1);
++        assert_eq!(recorded[0].5, 1);
++        assert_eq!(recorded[1].0, 1);
++        assert_eq!(recorded[1].5, 0);
++        assert_eq!(
++            (recorded[0].1, recorded[0].2, recorded[0].3, recorded[0].4),
++            (recorded[1].1, recorded[1].2, recorded[1].3, recorded[1].4)
++        );
++        let wire_x = u32::from(recorded[1].1) * 32767 / u32::from(recorded[1].3);
++        DESKTOP.with(|d| {
++            let shown = d.borrow().drawn.unwrap().1;
++            assert_eq!(shown.0, 1920.0 + f64::from(wire_x) * 719.0 / 32767.0);
++            *d.borrow_mut() = Desktop::default();
++        });
++    }
++    #[test]
++    fn invalid_maps_are_rejected() {
++        for s in [
++            "L 1 0\n",
++            "L 1 1 0 0 0 NaN 100\n",
++            "L 1 1 0 0 0 0 100\n",
++            "L 1 2 0 0 0 100 100 0 100 0 100 100\n",
++            "L 1 1 0 0 0 100 100",
++        ] {
++            assert!(parse_layout(s).is_none(), "{s}");
++        }
++    }
++    #[test]
++    fn displayed_coordinates_match_wire_quantization() {
++        let b = Rect {
++            x: -1920.0,
++            y: -100.0,
++            width: 1920.0,
++            height: 1080.0,
++        };
++        for i in 0..32767u32 {
++            let p = (b.x + f64::from(i) * (b.width - 1.0) / 32767.0, b.y + 53.25);
++            let (at, shown) = encode(b, p);
++            let nx = u32::from(at.0) * 32767 / 32768;
++            assert_eq!(nx, i);
++            assert_eq!(shown.0, b.x + f64::from(nx) * (b.width - 1.0) / 32767.0);
++        }
++    }
++}
+diff --git a/crates/reims-vgpu-window/src/native/linux/input.rs b/crates/reims-vgpu-window/src/native/linux/input.rs
+index 8246f9b4c54a0c6c3a870320fc424d758af1cb01..804e7078ba98e843224aa6c7854e185ab928a7fc 100644
+--- a/crates/reims-vgpu-window/src/native/linux/input.rs
++++ b/crates/reims-vgpu-window/src/native/linux/input.rs
+@@ -70,8 +70,10 @@ pub(crate) struct Reaction {
+ }
+ 
+ /// What the input sends the host, in the order it is sent.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Copy, Debug, PartialEq)]
+ pub(crate) enum ToHost {
++    /// Captured relative motion, in host points, with the current buttons.
++    Relative { dx: f64, dy: f64, buttons: u32 },
+     /// `pointer(x, y, width, height, buttons)`.
+     Pointer {
+         /// The guest pixel.
+@@ -137,6 +139,8 @@ fn fixed(points: f64) -> i32 {
+ pub(crate) struct Input {
+     /// The keys the guest was told are down.
+     keys: KeyState,
++    /// SDL successfully enabled relative mode for this capture.
++    relative: bool,
+     /// Who gets the keyboard.
+     capture: Capture,
+     /// The `BUTTON_*` bits of the buttons the guest was told are down.
+@@ -185,6 +189,12 @@ impl Input {
+     /// Queues the pointer at `point` over `image` in `mode`, with the buttons held, where it
+     /// differs from the one last sent (or `always`).
+     fn pointer(&mut self, point: (f64, f64), image: Rect, mode: (u16, u16), always: bool) {
++        if self.relative {
++            if always {
++                self.relative_moved(0.0, 0.0);
++            }
++            return;
++        }
+         let event = ToHost::Pointer {
+             at: geometry::pointer_to_guest(point, image, mode),
+             mode,
+@@ -196,6 +206,22 @@ impl Input {
+         }
+     }
+ 
++    /// Whether SDL is actually delivering unbounded relative motion.
++    pub(crate) fn set_relative(&mut self, enabled: bool) {
++        self.relative = enabled;
++    }
++
++    /// A relative motion event; SDL reports host points, not guest pixels.
++    pub(crate) fn relative_moved(&mut self, dx: f64, dy: f64) {
++        if self.relative && dx.is_finite() && dy.is_finite() {
++            self.out.push(ToHost::Relative {
++                dx,
++                dy,
++                buttons: self.buttons,
++            });
++        }
++    }
++
+     /// The pointer moved.
+     pub(crate) fn moved(&mut self, at: &At) {
+         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
+@@ -208,7 +234,7 @@ impl Input {
+         let (Some(point), Some(mode)) = (at.point, guest_mode(at)) else {
+             return Reaction::default();
+         };
+-        if bit == 0 || !geometry::contains(at.image, point) {
++        if bit == 0 || (!self.relative && !geometry::contains(at.image, point)) {
+             return Reaction::default();
+         }
+         let focusing = !self.focused
+@@ -246,7 +272,7 @@ impl Input {
+         let (Some(point), Some(_)) = (at.point, guest_mode(at)) else {
+             return;
+         };
+-        if !geometry::contains(at.image, point) {
++        if !self.relative && !geometry::contains(at.image, point) {
+             return;
+         }
+         self.moved(at);
+@@ -305,6 +331,9 @@ impl Input {
+     /// Releases capture, lifting every key held.
+     pub(crate) fn release_capture(&mut self) -> Reaction {
+         self.lift_keys();
++        if self.relative {
++            self.lift_buttons();
++        }
+         Reaction {
+             capture_changed: self.capture.release(),
+         }
+@@ -329,6 +358,10 @@ impl Input {
+             return;
+         }
+         self.buttons = 0;
++        if self.relative {
++            self.relative_moved(0.0, 0.0);
++            return;
++        }
+         if let Some(ToHost::Pointer { at, mode, .. }) = self.last {
+             let event = ToHost::Pointer {
+                 at,
+@@ -346,6 +379,11 @@ impl Input {
+ pub(crate) fn send(callbacks: &WindowCallbacks, events: Vec<ToHost>) {
+     for event in events {
+         match event {
++            ToHost::Relative { dx, dy, buttons } => {
++                if let Some(f) = &callbacks.relative_pointer {
++                    f(dx, dy, buttons);
++                }
++            }
+             ToHost::Pointer { at, mode, buttons } => {
+                 if let Some(f) = &callbacks.pointer {
+                     f(at.0, at.1, mode.0, mode.1, buttons);
+@@ -378,6 +416,65 @@ pub(crate) fn send(callbacks: &WindowCallbacks, events: Vec<ToHost>) {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn relative_capture_preserves_motion_buttons_and_release() {
++        let mut input = Input::new();
++        input.focus_gained(0);
++        let at = At {
++            point: Some((50.0, 25.0)),
++            image: Rect {
++                x: 0.0,
++                y: 0.0,
++                width: 100.0,
++                height: 50.0,
++            },
++            guest: Some((200, 100)),
++        };
++        input.button_down(BUTTON_LEFT, 1_000_000_000, &at);
++        assert!(matches!(
++            input.take().as_slice(),
++            [ToHost::Pointer {
++                buttons: BUTTON_LEFT,
++                ..
++            }]
++        ));
++        input.set_relative(true);
++        input.relative_moved(40.5, -12.25);
++        input.button_up(BUTTON_LEFT, &at);
++        assert_eq!(
++            input.take(),
++            vec![
++                ToHost::Relative {
++                    dx: 40.5,
++                    dy: -12.25,
++                    buttons: BUTTON_LEFT
++                },
++                ToHost::Relative {
++                    dx: 0.0,
++                    dy: 0.0,
++                    buttons: 0
++                },
++            ]
++        );
++        input.button_down(BUTTON_RIGHT, 2_000_000_000, &at);
++        input.release_capture();
++        assert_eq!(
++            input.take(),
++            vec![
++                ToHost::Relative {
++                    dx: 0.0,
++                    dy: 0.0,
++                    buttons: BUTTON_RIGHT
++                },
++                ToHost::Relative {
++                    dx: 0.0,
++                    dy: 0.0,
++                    buttons: 0
++                },
++            ]
++        );
++    }
++
+     /// A 100×50 image at the window's origin, a 200×100 guest mode, the pointer at `point`.
+     fn at(point: (f64, f64)) -> At {
+         At {
+diff --git a/crates/reims-vgpu-window/src/native/linux/sdl.rs b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+index 712fe6755c70bd9c476679beef0fe92b6ae8ee5b..836d067c1942d84074edf56c2d1da9a708549d5b 100644
+--- a/crates/reims-vgpu-window/src/native/linux/sdl.rs
++++ b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+@@ -93,6 +93,11 @@ impl Input {
+         self.0.is_captured()
+     }
+ 
++    /// SDL's current relative-mode state.
++    pub(crate) fn set_relative(&mut self, enabled: bool) {
++        self.0.set_relative(enabled);
++    }
++
+     /// Where the pointer is held over `image`, in the window's points: the image while captured.
+     pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
+         self.0.pointer_confinement(image)
+@@ -109,7 +114,9 @@ impl Input {
+         if events.is_empty() {
+             return;
+         }
+-        if let Some(callbacks) = window.callbacks() {
++        if super::desktop_pointer::enabled() {
++            super::desktop_pointer::send(window, events);
++        } else if let Some(callbacks) = window.callbacks() {
+             input::send(&callbacks, events);
+         }
+     }
+@@ -240,7 +247,16 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
+             // SAFETY: a motion event.
+             let point = unsafe { (event.motion.x, event.motion.y) };
+             let at = at(shell, point);
+-            shell.input.0.moved(&at);
++            // SAFETY: the live SDL window and a motion event, on its UI thread.
++            if unsafe { SDL_GetWindowRelativeMouseMode(shell.sdl) } {
++                let motion = unsafe { event.motion };
++                shell
++                    .input
++                    .0
++                    .relative_moved(f64::from(motion.xrel), f64::from(motion.yrel));
++            } else {
++                shell.input.0.moved(&at);
++            }
+             shell.pointer_over((f64::from(point.0), f64::from(point.1)));
+             false
+         }
+diff --git a/crates/reims-vgpu-window/src/native/linux/ui.rs b/crates/reims-vgpu-window/src/native/linux/ui.rs
+index e31a0727a6900c4f3a32b5e58a91ee4e92676c31..f676115d07b405bba095e34edffa5f49070a30eb 100644
+--- a/crates/reims-vgpu-window/src/native/linux/ui.rs
++++ b/crates/reims-vgpu-window/src/native/linux/ui.rs
+@@ -227,6 +227,7 @@ fn run() {
+     QUEUE.lock().phase = Phase::Running;
+     loop {
+         run_jobs();
++        super::desktop_pointer::render();
+         // SAFETY: an all-zero event is a valid one for SDL to fill.
+         let mut event: SDL_Event = unsafe { std::mem::zeroed() };
+         // SAFETY: SDL's video runs on this thread.
+diff --git a/crates/reims-vgpu-window/src/sdl/shell.rs b/crates/reims-vgpu-window/src/sdl/shell.rs
+index 120c07da849cdace07bd28e06214312f95fd074b..52e63cb518112e261aa00a730d4c40657117fdb5 100644
+--- a/crates/reims-vgpu-window/src/sdl/shell.rs
++++ b/crates/reims-vgpu-window/src/sdl/shell.rs
+@@ -216,6 +216,8 @@ fn destroy(id: u64) {
+         Some(open.remove(at))
+     });
+     if let Some(shell) = shell {
++        #[cfg(target_os = "linux")]
++        crate::native::desktop_pointer::remove(shell.window.port());
+         let sdl = shell.sdl;
+         let title = shell.window.title().to_owned();
+         os::destroy(shell);
+@@ -268,6 +270,8 @@ pub(crate) fn screens_changed() {
+ /// present into a surface the compositor does not show, which under FIFO blocks the present
+ /// until it shows again.
+ pub(crate) fn batch_over() {
++    #[cfg(target_os = "linux")]
++    crate::native::desktop_pointer::render();
+     OPEN.with(|open| {
+         for shell in open.borrow_mut().iter_mut() {
+             if let Some(shown) = shell.shown.take()
+@@ -287,6 +291,10 @@ fn settled(before: Option<bool>, kind: u32) -> Option<bool> {
+ 
+ /// An SDL event for a window: its window's, else nothing.
+ pub(crate) fn event(event: &SDL_Event) {
++    #[cfg(target_os = "linux")]
++    if crate::native::desktop_pointer::event(event) {
++        return;
++    }
+     // SAFETY: every event starts with its type, and each arm reads the variant its type names.
+     let kind = unsafe { event.r#type };
+     let sdl_id = match kind {
+@@ -394,12 +402,41 @@ impl Shell {
+         os::grab_keyboard(self, self.input.is_captured());
+         self.confine_pointer();
+         self.refresh_title();
++        #[cfg(target_os = "linux")]
++        crate::native::desktop_pointer::capture(self.window.port(), self.input.is_captured());
+         self.refresh_cursor();
+     }
+ 
+     /// Holds the pointer over the image while captured, and frees it when not (the module doc):
+     /// SDL's mouse rect, else its mouse grab of the whole window where SDL refuses the rect.
+-    fn confine_pointer(&self) {
++    fn confine_pointer(&mut self) {
++        #[cfg(target_os = "linux")]
++        {
++            let requested = self.input.is_captured()
++                && self
++                    .window
++                    .callbacks()
++                    .is_some_and(|c| c.relative_pointer.is_some());
++            // SAFETY: the live window on SDL's UI thread.
++            unsafe {
++                if requested {
++                    // A desktop pointer should retain the compositor's acceleration
++                    // curve when captured. SDL defaults to raw device motion.
++                    // Environment overrides still allow callers to request raw input.
++                    SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, c"1".as_ptr());
++                }
++                if !SDL_SetWindowRelativeMouseMode(self.sdl, requested) && requested {
++                    refused("relative mouse capture unavailable", self.window.title());
++                }
++                let relative = SDL_GetWindowRelativeMouseMode(self.sdl);
++                self.input.set_relative(relative);
++                if relative {
++                    SDL_SetWindowMouseRect(self.sdl, std::ptr::null());
++                    SDL_SetWindowMouseGrab(self.sdl, false);
++                    return;
++                }
++            }
++        }
+         let rect = self
+             .input
+             .pointer_confinement(self.layout.image)
+@@ -451,6 +488,8 @@ impl Shell {
+             }
+         }
+         self.window.surface().set_layout(layout);
++        #[cfg(target_os = "linux")]
++        crate::native::desktop_pointer::register(&self.window, self.sdl, layout.image);
+     }
+ 
+     /// The pointer moved to `point` (in points): the cursor changes as it enters or leaves the
+@@ -466,6 +505,21 @@ impl Shell {
+     /// Sets the cursor: over the image the guest's, or none while the guest hides its own; the
+     /// host's arrow elsewhere and before the guest has set one.
+     fn refresh_cursor(&mut self) {
++        #[cfg(target_os = "linux")]
++        crate::native::desktop_pointer::glyph(&self.window);
++        #[cfg(target_os = "linux")]
++        if (self.over_image || self.input.is_captured())
++            && (!crate::native::desktop_pointer::enabled() || self.input.is_captured())
++            && self
++                .window
++                .callbacks()
++                .is_some_and(|c| c.relative_pointer.is_some())
++        {
++            // The guest renders the cursor into its framebuffer for this mode.
++            // SAFETY: SDL's UI thread.
++            unsafe { SDL_HideCursor() };
++            return;
++        }
+         let guest = self.window.guest();
+         let ours = if self.over_image {
+             let per_pixel =
+diff --git a/crates/reims-vgpu/src/display.rs b/crates/reims-vgpu/src/display.rs
+index 0592bc5b38b61f1371eb13c74c704c96efd2db02..49ad377a058015cd3c7231688ceae61d82619dfc 100644
+--- a/crates/reims-vgpu/src/display.rs
++++ b/crates/reims-vgpu/src/display.rs
+@@ -323,8 +323,19 @@ impl<P: ApiPlatform> Display<P> {
+             let link = match config.window.take() {
+                 None => None,
+                 Some(wcfg) => {
++                    #[cfg(target_os = "linux")]
++                    let software_cursor = wcfg.callbacks.relative_pointer.is_some()
++                        && !reims_vgpu_window::host_cursor_enabled();
+                     let w = Window::new(wcfg, port, reims_vgpu_window::handle::title(port));
+                     config.callbacks = window::tee(&w, std::mem::take(&mut config.callbacks));
++                    #[cfg(target_os = "linux")]
++                    if software_cursor {
++                        // No hardware cursor capability: the guest composites its cursor
++                        // into the framebuffer, including on a different captured head.
++                        config.callbacks.cursor_glyph = None;
++                        config.callbacks.cursor_show = None;
++                        config.callbacks.cursor_move = None;
++                    }
+                     if w.match_host_screen()
+                         && let Some((modes, density)) = window::host_matched(
+                             window::host_screen::<P>(port).as_ref(),
+diff --git a/crates/reims-vgpu/src/lib.rs b/crates/reims-vgpu/src/lib.rs
+index 05f409461a29ffd6ec5d5553a57fe86f2118370c..c5728d98bd49082a28955faa595e90ebe9e27f69 100644
+--- a/crates/reims-vgpu/src/lib.rs
++++ b/crates/reims-vgpu/src/lib.rs
+@@ -72,8 +72,8 @@ pub type DefaultPlatform = MetalPlatform;
+ pub type DefaultPlatform = VulkanPlatform;
+ pub use reims_vgpu_window::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+-    MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
+-    WindowConfig,
++    MomentumPhase, PointerFn, RelativePointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
++    WindowCallbacks, WindowConfig,
+ };
+ 
+ /// The most display ports a device has.
+diff --git a/docs/api.md b/docs/api.md
+index 780ae4d3a5de3738fdb698867bfe28b470728f56..2861413fece526c576ab2ca52b137b265674fa4f 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -240,6 +240,7 @@ Everything a host can set that shapes what the guest is offered or what the libr
+   | variable | what it does |
+   |---|---|
+   | `REIMS_VGPU_LOG` | the library's log lines to stderr, or to the log hook, filtered by a level and `target=level` pairs (`warn,reims_vgpu_core::fifo=debug`); unset, nowhere ("The log hook", above) |
++  | `REIMS_VGPU_EARLY_DISPLAY_PORTS` | `1`: expose the full display port count and connection types before binary version 245; read once per process, off by default. Requires a guest framebuffer driver that supports multiple ports; does not change version negotiation or input routing |
+   | `REIMS_VGPU_STATS` | `1`, `true`, `yes` or `on`: a line of frame statistics a second per display ("Frame statistics", above) |
+   | `REIMS_VGPU_WINDOW_SCREENS`, `_BORDERLESS`, `_REFRESH` | a window's screen, its style and the offered modes' refresh rate ("The environment", under "A display's window", above) |
+   | `REIMS_VGPU_WINDOW_IMPL` | macOS: `sdl` opens SDL3's window in place of AppKit's, in a build with `macos-sdl` |
+@@ -249,7 +250,7 @@ Everything a host can set that shapes what the guest is offered or what the libr
+   | `REIMS_VGPU_TRACE` | the Vulkan platform, a diagnostic for profiling: a timeline of the device's work, a line per event, written to the file it names (core's `trace` module); the Metal platform writes nothing |
+   | `REIMS_VGPU_TRACE_DEGRADE` | with `REIMS_VGPU_TRACE`, `1`: every occurrence of every difference from Metal the runtime announces is written to the trace; the log is as without it |
+ 
+-  `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform (the trace's two change only the trace and the log lines); `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
++  `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). `REIMS_VGPU_EARLY_DISPLAY_PORTS` changes the guest-visible display registers on either platform. Of the remaining variables, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform (the trace's two change only the trace and the log lines); `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
+ 
+ ### cbindgen
+ 
+@@ -788,3 +789,27 @@ The API rests on these decisions.
+ | 7 | How are a Metal device's capabilities covered, when a host cannot hand the library a device lacking them? | **Core's unit tests**: `device::tests::a_device_without_the_capabilities_leaves_them_out_of_device_info` turns off detach backing, the address-range heaps and buffers, IOSurface buffers, shared texture handles, dynamic stride, image blocks and command buffer jump, and `a_paravirtual_device_keeps_argument_buffers_off` names the device as a paravirtual GPU. |
+ | 8 | Does an uncommitted frame that is released stay counted in flight, so that every later present waits its 2 s, as when a host of Apple's SDK drops an uncommitted command buffer? | **Yes**, and the header says so. Committing on release would change what a present waits for. |
+ | 9 | Do the runner's `encode` records keep Metal's numeric command buffer status, or the API's status name? | **The name.** The runner records what the API answers. |
++
++
++### Experimental relative window input (Linux)
++
++`RvgWindowCallbacks.relative_pointer(ctx, dx, dy, buttons)` is appended at byte
++64, extending the table to 72 bytes. Tables of 56 or 64 bytes retain their prior
++behavior. Non-NULL opts the Linux window into SDL relative capture: motion is
++in host points (positive right/down), buttons use `RVG_WINDOW_BUTTON_*`, and
++button-only events have zero deltas. The capture click uses `pointer` first.
++The callback follows the same threading/lifetime rules as `pointer`. Other
++host platforms ignore it. If SDL refuses relative mode, input retains its
++absolute confinement and logs the refusal.
++
++By default a relative-input window display advertises no hardware cursor
++handlers on Linux, allowing the guest to render its cursor into the framebuffer.
++Hosts must verify their guest's software-cursor fallback before enabling it.
++
++The separate experimental `REIMS_VGPU_HOST_CURSOR_SOCKET` option retains cursor
++handlers and uses a local overlay with guest-layout feedback. In that mode the
++window routes captured input through the destination window's absolute `pointer`
++callback, with a 32768-unit coordinate range, instead of calling
++`relative_pointer` for each movement. The latter callback remains the capture
++opt-in. The companion protocol, limitations and acceptance status are documented
++in `scripts/multimonitor/README.md`.
+diff --git a/scripts/multimonitor/README.md b/scripts/multimonitor/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..c150fe99c9ba73167f86858f224f7a331a38a089
+--- /dev/null
++++ b/scripts/multimonitor/README.md
+@@ -0,0 +1,191 @@
++# Guest-aware pointer companion (experimental)
++
++`guest_pointer.py` runs inside a macOS guest and maps each host window's
++normalized pointer coordinates into the matching guest display's current
++global desktop bounds. It needs Python 3 and existing Accessibility trust.
++It checks trust without requesting or changing permissions. It loads the
++macOS frameworks through `ctypes`; it needs no third-party Python package.
++
++This directory includes the guest endpoint, an SSH relay, and CPU tests.
++The paired QEMU input device is in `vendor/qemu/hw/input/reims-pointer.c`.
++No persistent launch, automatic startup, or deployment is provided here.
++
++## Identity and geometry
++
++The default map requires vendor 4102 and serial `head + 1`. That vendor was
++measured on the test guest. QEMU's `hw/display/apple-gfx.c` initializes
++`next_pgdisplay_serial_num` to 1 and increments it across all devices, so
++this default applies to the first/only apple-gfx device. `--vendor` and
++`--serial-base` support an explicit, independently verified alternate map.
++Display enumeration order and numeric CoreGraphics display IDs are never
++used to assign heads.
++
++The helper resolves every configured head before announcing readiness and
++again before each pointer packet. Missing, ambiguous, mirrored, or invalid
++maps fail closed. Bounds come from `CGDisplayBounds`, including negative
++origins and HiDPI logical dimensions; backing pixel dimensions are not used.
++The 32767 endpoint maps to the last coordinate inside a display, avoiding
++an accidental crossing onto a neighbor.
++
++## Transport protocol
++
++Run with the desired head count, for example:
++
++```sh
++/usr/bin/python3 guest_pointer.py --heads 2 --vendor 4102 --serial-base 1
++```
++
++A trusted local relay supplies ASCII lines on stdin:
++
++```text
++R 1
++P 1 HEAD X Y BUTTONS WHEEL_X WHEEL_Y
++```
++
++- `R 1` releases held buttons and clears click history at session start.
++- `HEAD` is zero-based and less than `--heads`.
++- `X` and `Y` are integers in 0..32767, relative to that head.
++- `BUTTONS` is the current mask: left=1, right=2, middle=4, back=8, forward=16.
++- Wheel values are signed integer notches: positive X is left; positive Y
++  is up. Each value must be in -32767..32767.
++
++Stdout contains only `READY 1\n`, emitted after native trust and initial
++map validation and recovery of any native held buttons from a previous helper. Diagnostics go to stderr. The relay must wait for readiness
++and close stdin on transport loss. EOF, reset, malformed packets, mapping
++failures, SIGTERM and SIGHUP release held buttons. Malformed input ends the session;
++it is not silently skipped. There is no idle timeout: without a heartbeat,
++an idle connection cannot be distinguished from an intentional held drag.
++A forced SIGKILL cannot run cleanup; the next helper startup queries native
++button state and releases only buttons still down, at the current cursor.
++
++Mouse transitions are explicit; dragging uses the previously held button
++state before release at the new coordinate. Left/right/middle/other-button
++events, mouse deltas, global session modifier flags, click counts, and both
++scroll axes are supplied to CoreGraphics. Double-click timing uses
++`NSEvent.doubleClickInterval`; proximity is limited to four desktop units
++on the same head. Moving a held drag outside that tolerance clears its click
++history. Applications may interpret side buttons differently.
++
++## Verification
++
++Run the CPU tests from the repository root:
++
++```sh
++python3 -B -m unittest discover -s scripts/multimonitor -p 'test_guest_pointer.py' -v
++```
++
++The 30 companion tests cover relative crossing and edge sliding, framing and ranges, display identity, negative origins,
++HiDPI geometry, live rearrangement, drag ordering, all button edges, click
++counts, wheels, resets, EOF, malformed input, hot unplug release failure, and native-state recovery after a helper crash.
++They use a fake backend and load no graphics framework or GPU.
++
++An Intel Tahoe 26.7 native smoke test in the integration investigation
++resolved all framework symbols and returned `READY 1` with existing
++Accessibility trust. A head-1 center packet independently read back at
++(2279.5, 719.5), the center of that guest's portrait display. That smoke test
++preceded the explicit mouse-delta fields; the integration's canvas tests
++must establish native click/drag/scroll and modifier behavior. Full
++host-window-to-guest acceptance and physical pointer use are separate gates.
++
++API references:
++[global display bounds](https://developer.apple.com/documentation/coregraphics/cgdisplaybounds(_:)),
++[click counts](https://developer.apple.com/documentation/coregraphics/cgeventfield/mouseeventclickstate),
++[scroll units](https://developer.apple.com/documentation/coregraphics/cgscrolleventunit).
++
++
++## Captured crossing (experimental Linux integration)
++
++Build this library and the paired QEMU changes together. Opt in with
++`REIMS_VGPU_RELATIVE_POINTER=1` and add a bridge connected to an explicit
++local socket:
++
++```text
++-chardev socket,id=pointer,path=/private/path/pointer.sock,server=on,wait=off
++-device reims-pointer,chardev=pointer,display=gfx,heads=2
++```
++
++Keep the socket in a private directory. The device accepts socket chardevs
++only, refuses migration, and drops input until the trusted companion is ready.
++Start the relay after the guest desktop and SSH are available:
++
++```sh
++python3 scripts/multimonitor/relay.py --socket /private/path/pointer.sock \
++  --ssh-host YOUR_GUEST --guest-helper /path/in/guest/guest_pointer.py --heads 2
++```
++
++A click establishes the guest position using the addressed display. While
++captured, SDL reports relative motion without a window-edge limit, retaining
++the host acceleration curve. `SDL_MOUSE_RELATIVE_SYSTEM_SCALE=0` explicitly
++requests raw motion instead. QEMU sends
++`M 1 HEAD DX DY BUTTONS WHEEL_X WHEEL_Y`; fields have the same limits as `P`,
++except deltas are signed -32767..32767 host points. `HEAD` identifies the source
++window, not the destination display. The companion follows the current guest
++desktop arrangement, preserving held buttons when crossing. Unmatched edges
++stop the cursor; diagonal motion slides along them. Gaps cannot be jumped.
++
++Arrange the displays inside macOS System Settings → Displays → Arrange, using
++an extended desktop. Linux window placement does not define guest positions.
++The companion reloads display bounds for every packet. Ctrl+Alt+Super releases
++capture and held buttons. Closing a display window retains QEMU's shutdown
++behavior. Keyboard focus stays in the capturing host window while the guest
++cursor crosses displays.
++
++Relative windows advertise no hardware cursor capability, requesting the
++guest's software-cursor fallback. An Intel Tahoe cold-boot check verified
++relative QEMU input crossing from the main display to its right-hand neighbor
++and back. Independent CoreGraphics position reads confirmed the crossing, and
++a framebuffer comparison showed the visible cursor on the destination display.
++Physical SDL border crossing was also confirmed, with a reported slow/heavy
++pointer feel. Captured motion now requests the host acceleration curve, but
++a physical retest still reported heavier movement than the original. The relative-only
++regression remains unresolved; the accepted local-overlay mode is described below. A stationary guest microbenchmark measured
++median relative-event processing of 0.56 ms, with one 32 ms outlier; it does
++not measure transport or visible cursor latency. Software-cursor frame latency
++and host-to-guest movement scaling still need investigation. Clicks after
++crossing and live rearrangement remain separate acceptance checks. Other host platforms keep
++their existing behavior.
++
++The relay handles fragmented readiness with a deadline, preserves packet order
++and queued releases on socket EOF, bounds queued input, and closes a stalled
++connection. SSH keepalives detect transport loss. `input_probe.swift` is an
++optional disposable AppKit test surface; its log records events actually
++received by each test window.
++
++```sh
++python3 -B -m unittest discover -s scripts/multimonitor -p 'test_*.py'
++python3 scripts/multimonitor/test_qemu_pointer.py --qemu /path/to/qemu-system-x86_64 \
++  --firmware-dir /path/to/qemu/share/qemu
++```
++
++
++## Experimental host cursor (local physical acceptance)
++
++Set `REIMS_VGPU_HOST_CURSOR_SOCKET` to an unused Unix socket path in a private
++local directory before launching the relative build. Pass the same path to the
++relay with `--layout-socket`. The helper's opt-in `--report-layout` mode emits
++`L 1 COUNT HEAD X Y WIDTH HEIGHT ...` after readiness and when display bounds
++change; it checks while idle every 250 ms. The relay forwards this bounded
++feedback stream to the window library. Disconnecting it releases capture.
++Rearranging displays also releases capture: click to capture again with the
++new layout. Ordinary single-monitor and relative-only modes are unchanged.
++
++The host integrates accelerated input locally using the guest display map and
++the destination window's scale. It sends absolute coordinates to the companion
++and draws its cursor at the same quantized location. A transparent SDL tooltip
++surface carries the guest cursor image independently of guest-frame rendering;
++it never takes focus or input. This is a host-rendered overlay, not the native
++hardware cursor plane, so equivalent latency is a measurement target, not an
++established result. Guest hardware-cursor callbacks remain enabled to suppress
++the software cursor in the guest framebuffer.
++
++The prototype is currently limited to one configured guest desktop per process.
++Linux enables SDL's renderer subsystem for the popup: Wayland's window-surface
++API uses a texture framebuffer and fails with video-only SDL builds.
++
++On Fedora/Wayland with the two-head Tahoe guest, the 2026-10-22 guarded physical
++test was accepted as "visible, aligned, and lighter" and "workable". The cursor
++surfaces created without errors after enabling SDL's renderer. This verifies the
++tested setup, not measured equivalence with hardware-cursor latency or all layouts.
++Source tests cover geometry and coordinate agreement. Broader drag, cursor-shape,
++scaling and rearrangement checks remain; guest-initiated cursor warps are not yet
++reconciled while captured. No normal launcher enables this mode by default.
+diff --git a/scripts/multimonitor/guest_pointer.py b/scripts/multimonitor/guest_pointer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..609e7fa41d8c0434a20091ee96cb74d9317d2c9c
+--- /dev/null
++++ b/scripts/multimonitor/guest_pointer.py
+@@ -0,0 +1,424 @@
++#!/usr/bin/env python3
++"""Route reims pointer protocol v1 to identified macOS guest displays.
++
++Only READY is written to stdout. Input is trusted local transport, never a
++network listener. No permissions are requested or changed by this program.
++"""
++import argparse
++import ctypes
++import dataclasses
++import math
++import os
++import selectors
++import signal
++import sys
++import time
++
++
++@dataclasses.dataclass(frozen=True)
++class Display:
++    identifier: int
++    vendor: int
++    serial: int
++    x: float
++    y: float
++    width: float
++    height: float
++    mirrored: bool = False
++
++
++@dataclasses.dataclass(frozen=True)
++class Relative:
++    head: int
++    dx: int
++    dy: int
++    buttons: int
++    wheel_x: int
++    wheel_y: int
++
++
++def parse_packet(line, heads):
++    """Strict, bounded ASCII framing; returns None for a release/reset."""
++    if not line.endswith(b"\n") or len(line) > 160:
++        raise ValueError("invalid packet framing")
++    try:
++        words = line.decode("ascii").split()
++    except UnicodeDecodeError as error:
++        raise ValueError("packet is not ASCII") from error
++    if words == ["R", "1"]:
++        return None
++    if len(words) != 8 or words[0] not in ("P", "M") or words[1] != "1":
++        raise ValueError("unknown protocol or packet")
++    # Reject Python int syntax outside the signed decimal wire format.
++    for value in words[2:]:
++        digits = value[1:] if value.startswith("-") else value
++        if not digits or not all("0" <= c <= "9" for c in digits):
++            raise ValueError("invalid decimal field")
++    head, x, y, buttons, wheel_x, wheel_y = map(int, words[2:])
++    if not 0 <= head < heads:
++        raise ValueError("head out of range")
++    minimum = -32767 if words[0] == "M" else 0
++    if not (minimum <= x <= 32767 and minimum <= y <= 32767 and 0 <= buttons <= 31):
++        raise ValueError("coordinates or buttons out of range")
++    if not (-32767 <= wheel_x <= 32767 and -32767 <= wheel_y <= 32767):
++        raise ValueError("wheel out of range")
++    if words[0] == "M":
++        return Relative(head, x, y, buttons, wheel_x, wheel_y)
++    return head, x, y, buttons, wheel_x, wheel_y
++
++
++def display_map(displays, heads, vendor, serial_base):
++    """Match explicit EDID identities, never enumeration order or display ID."""
++    result = {}
++    for head in range(heads):
++        matches = [d for d in displays if d.vendor == vendor and d.serial == serial_base + head]
++        if len(matches) != 1:
++            raise ValueError("head %d display identity unavailable or ambiguous" % head)
++        d = matches[0]
++        if d.mirrored or not all(math.isfinite(v) for v in (d.x, d.y, d.width, d.height)):
++            raise ValueError("head %d has unusable display bounds" % head)
++        if d.width < 1 or d.height < 1:
++            raise ValueError("head %d has empty display bounds" % head)
++        result[head] = d
++    if len({d.identifier for d in result.values()}) != heads:
++        raise ValueError("heads resolve to the same display")
++    return result
++
++
++def position(display, x, y):
++    # CGDisplayBounds is in global desktop coordinates, including negative
++    # origins. Do not use backing pixel dimensions: those differ with HiDPI.
++    # Keep the inclusive normalized endpoint inside this display's rectangle.
++    return (display.x + x * (display.width - 1) / 32767,
++            display.y + y * (display.height - 1) / 32767)
++
++
++def relative_position(displays, point, dx, dy):
++    """Sweep through adjoining display rectangles; stop at gaps and slide at edges.
++
++    Closed geometric edges are used for the sweep, so adjacent displays meet
++    without a one-pixel gap. The final cursor is clamped inside a real display.
++    """
++    rectangles = list(displays.items())
++
++    def sweep(start, delta):
++        intervals = []
++        for _, d in rectangles:
++            lo, hi = 0.0, 1.0
++            for origin, movement, low, high in (
++                    (start[0], delta[0], d.x, d.x + d.width),
++                    (start[1], delta[1], d.y, d.y + d.height)):
++                if movement == 0:
++                    if not low <= origin <= high:
++                        hi = -1
++                        break
++                else:
++                    a, b = sorted(((low - origin) / movement, (high - origin) / movement))
++                    lo, hi = max(lo, a), min(hi, b)
++            if lo <= hi:
++                intervals.append((lo, hi))
++        end = 0.0
++        for lo, hi in sorted(intervals):
++            if lo > end + 1e-9:
++                break
++            end = max(end, hi)
++        return (start[0] + delta[0] * end, start[1] + delta[1] * end), end
++
++    reached, fraction = sweep(point, (dx, dy))
++    if fraction < 1:
++        # Keep the traversable component of diagonal motion along a wall.
++        candidates = [sweep(reached, (dx * (1 - fraction), 0))[0],
++                      sweep(reached, (0, dy * (1 - fraction)))[0]]
++        reached = max(candidates, key=lambda p: math.dist(p, reached))
++    candidates = [(head, (min(max(reached[0], d.x), d.x + d.width - 1),
++                          min(max(reached[1], d.y), d.y + d.height - 1)))
++                  for head, d in rectangles]
++    return min(candidates, key=lambda item: math.dist(item[1], reached))
++
++
++class Pointer:
++    def __init__(self, backend, heads=2, vendor=4102, serial_base=1, clock=time.monotonic):
++        self.backend = backend
++        self.heads = heads
++        self.vendor = vendor
++        self.serial_base = serial_base
++        self.clock = clock
++        self.buttons = 0
++        self.point = (0.0, 0.0)
++        self.head = None
++        self.clicks = {}
++        self.active_clicks = {}
++
++    def mapping(self):
++        return display_map(self.backend.displays(), self.heads, self.vendor, self.serial_base)
++
++    def reset(self):
++        """Release at last valid location even if a display has disappeared."""
++        failure = None
++        try:
++            native_buttons = self.backend.held_buttons() & 31
++            if native_buttons and not self.buttons:
++                # A previous helper may have died after posting a mouse-down.
++                # Recover at the current cursor, never this instance's (0, 0).
++                self.point = self.backend.pointer_position()
++            self.buttons |= native_buttons
++        except (RuntimeError, OSError) as error:
++            # Still attempt releases for this instance's tracked buttons.
++            failure = error
++        for button in range(5):
++            if self.buttons & (1 << button):
++                try:
++                    self.backend.mouse("up", button, self.point, self.active_clicks.get(button, 1))
++                except (RuntimeError, OSError) as error:
++                    failure = failure or error
++                finally:
++                    self.buttons &= ~(1 << button)
++        self.clicks.clear()
++        self.active_clicks.clear()
++        self.head = None
++        if failure:
++            raise failure
++
++    def accept(self, packet):
++        if packet is None:
++            self.reset()
++            return
++        mapping = self.mapping()
++        if isinstance(packet, Relative):
++            if self.head is None:
++                self.point = self.backend.pointer_position()
++            head, point = relative_position(mapping, self.point, packet.dx, packet.dy)
++            buttons, wheel_x, wheel_y = packet.buttons, packet.wheel_x, packet.wheel_y
++        else:
++            head, x, y, buttons, wheel_x, wheel_y = packet
++            point = position(mapping[head], x, y)
++        # Move with the OLD button state so a final release packet also moves
++        # the dragged object to its destination before releasing it.
++        held = next((button for button in range(5) if self.buttons & (1 << button)), None)
++        self.backend.mouse("move" if held is None else "drag", held or 0, point, 0)
++        self.point = point
++        for button in range(5):
++            previous = self.clicks.get(button)
++            if self.buttons & (1 << button) and previous:
++                _, last_head, last_point, _ = previous
++                if head != last_head or math.hypot(point[0] - last_point[0], point[1] - last_point[1]) > 4:
++                    # A drag is not the first half of a double-click, even if
++                    # the pointer returns to its original location.
++                    self.clicks.pop(button)
++        now = self.clock()
++        for button in range(5):
++            mask = 1 << button
++            if self.buttons & mask and not buttons & mask:
++                self.backend.mouse("up", button, point, self.active_clicks.pop(button, 1))
++                self.buttons &= ~mask
++            elif buttons & mask and not self.buttons & mask:
++                previous = self.clicks.get(button)
++                count = 1
++                if previous:
++                    when, last_head, last_point, last_count = previous
++                    distance = math.hypot(point[0] - last_point[0], point[1] - last_point[1])
++                    if head == last_head and now - when <= self.backend.double_click_interval and distance <= 4:
++                        count = last_count + 1
++                self.clicks[button] = (now, head, point, count)
++                self.active_clicks[button] = count
++                # Track before posting so a backend failure still triggers a
++                # conservative release during teardown.
++                self.buttons |= mask
++                self.backend.mouse("down", button, point, count)
++        self.head = head
++        if wheel_x or wheel_y:
++            self.backend.scroll(point, wheel_x, wheel_y)
++
++
++def layout_packet(mapping):
++    fields = ["L", "1", str(len(mapping))]
++    for head, d in sorted(mapping.items()):
++        fields.extend(map(str, (head, d.x, d.y, d.width, d.height)))
++    return " ".join(fields) + "\n"
++
++
++def layout_lines(stream, output, pointer):
++    """Report layout changes even while idle; bound frames without buffered-read stalls."""
++    previous = None
++    pending = bytearray()
++    with selectors.DefaultSelector() as selector:
++        selector.register(stream, selectors.EVENT_READ)
++        while True:
++            current = layout_packet(pointer.mapping())
++            if current != previous:
++                output.write(current)
++                output.flush()
++                previous = current
++            if not selector.select(.25):
++                continue
++            chunk = os.read(stream.fileno(), 4096)
++            if not chunk:
++                if pending:
++                    raise ValueError("truncated input packet")
++                return
++            pending.extend(chunk)
++            while b"\n" in pending:
++                line, _, rest = pending.partition(b"\n")
++                pending = bytearray(rest)
++                yield bytes(line) + b"\n"
++            if len(pending) > 160:
++                raise ValueError("oversized input packet")
++
++
++def serve(stream, output, pointer, report_layout=False):
++    """One transport session. Malformed input is fatal, with held keys released."""
++    try:
++        pointer.mapping()
++        pointer.reset()
++        output.write("READY 1\n")
++        output.flush()
++        lines = layout_lines(stream, output, pointer) if report_layout else iter(lambda: stream.readline(161), b"")
++        for line in lines:
++            pointer.accept(parse_packet(line, pointer.heads))
++    finally:
++        pointer.reset()
++
++
++class CGPoint(ctypes.Structure):
++    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
++
++
++class CGSize(ctypes.Structure):
++    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
++
++
++class CGRect(ctypes.Structure):
++    _fields_ = [("origin", CGPoint), ("size", CGSize)]
++
++
++class MacBackend:
++    def __init__(self):
++        if sys.platform != "darwin":
++            raise RuntimeError("native pointer injection requires macOS")
++        self.cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
++        self.cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
++        ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
++        ax.AXIsProcessTrusted.restype = ctypes.c_bool
++        ax.AXIsProcessTrusted.argtypes = []
++        if not ax.AXIsProcessTrusted():
++            raise RuntimeError("Accessibility trust is required; no permission changes were made")
++        self._bind("CGGetActiveDisplayList", ctypes.c_int32,
++                   [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)])
++        for name in ("CGDisplayVendorNumber", "CGDisplaySerialNumber", "CGDisplayMirrorsDisplay"):
++            self._bind(name, ctypes.c_uint32, [ctypes.c_uint32])
++        self._bind("CGDisplayBounds", CGRect, [ctypes.c_uint32])
++        self._bind("CGEventCreate", ctypes.c_void_p, [ctypes.c_void_p])
++        self._bind("CGEventGetLocation", CGPoint, [ctypes.c_void_p])
++        self._bind("CGEventCreateMouseEvent", ctypes.c_void_p,
++                   [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32])
++        self._bind("CGEventSourceFlagsState", ctypes.c_uint64, [ctypes.c_int32])
++        self._bind("CGEventSourceButtonState", ctypes.c_bool, [ctypes.c_int32, ctypes.c_uint32])
++        self._bind("CGEventSetFlags", None, [ctypes.c_void_p, ctypes.c_uint64])
++        self._bind("CGEventSetIntegerValueField", None, [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64])
++        self._bind("CGEventSetLocation", None, [ctypes.c_void_p, CGPoint])
++        self._bind("CGEventPost", None, [ctypes.c_uint32, ctypes.c_void_p])
++        # Fixed-argument API avoids a variadic ctypes ABI across Intel/arm64.
++        self._bind("CGEventCreateScrollWheelEvent2", ctypes.c_void_p,
++                   [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
++                    ctypes.c_int32, ctypes.c_int32, ctypes.c_int32])
++        self.cf.CFRelease.restype = None
++        self.cf.CFRelease.argtypes = [ctypes.c_void_p]
++        self.last_point = self.pointer_position()
++        ctypes.CDLL("/System/Library/Frameworks/AppKit.framework/AppKit")
++        objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
++        objc.objc_getClass.restype = ctypes.c_void_p
++        objc.objc_getClass.argtypes = [ctypes.c_char_p]
++        objc.sel_registerName.restype = ctypes.c_void_p
++        objc.sel_registerName.argtypes = [ctypes.c_char_p]
++        # double is returned in an SSE register on x86_64 (not fpret).
++        call = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
++        self.double_click_interval = call(objc.objc_getClass(b"NSEvent"), objc.sel_registerName(b"doubleClickInterval"))
++
++    def held_buttons(self):
++        return sum(1 << button for button in range(5)
++                   if self.cg.CGEventSourceButtonState(0, button))
++
++    def pointer_position(self):
++        event = self.cg.CGEventCreate(None)
++        if not event:
++            raise RuntimeError("cannot read current pointer location")
++        try:
++            point = self.cg.CGEventGetLocation(event)
++            return point.x, point.y
++        finally:
++            self.cf.CFRelease(event)
++
++    def _bind(self, name, result, arguments):
++        function = getattr(self.cg, name)
++        function.restype = result
++        function.argtypes = arguments
++
++    def displays(self):
++        ids = (ctypes.c_uint32 * 64)()
++        count = ctypes.c_uint32()
++        if self.cg.CGGetActiveDisplayList(64, ids, ctypes.byref(count)) or count.value >= 64:
++            raise RuntimeError("cannot enumerate active displays")
++        result = []
++        for identifier in ids[:count.value]:
++            bounds = self.cg.CGDisplayBounds(identifier)
++            result.append(Display(identifier, self.cg.CGDisplayVendorNumber(identifier),
++                                  self.cg.CGDisplaySerialNumber(identifier), bounds.origin.x,
++                                  bounds.origin.y, bounds.size.width, bounds.size.height,
++                                  bool(self.cg.CGDisplayMirrorsDisplay(identifier))))
++        return result
++
++    def _post(self, event, point, clicks=None, delta=None):
++        if not event:
++            raise RuntimeError("CoreGraphics could not create an event")
++        try:
++            # Combined session flags preserve modifiers from the VM keyboard.
++            self.cg.CGEventSetFlags(event, self.cg.CGEventSourceFlagsState(0))
++            self.cg.CGEventSetLocation(event, CGPoint(*point))
++            if clicks is not None:
++                self.cg.CGEventSetIntegerValueField(event, 1, clicks)
++            if delta is not None:
++                self.cg.CGEventSetIntegerValueField(event, 4, round(delta[0]))
++                self.cg.CGEventSetIntegerValueField(event, 5, round(delta[1]))
++            self.cg.CGEventPost(0, event)  # kCGHIDEventTap
++        finally:
++            self.cf.CFRelease(event)
++
++    def mouse(self, action, button, point, clicks):
++        types = {"move": (5, 5, 5), "drag": (6, 7, 27),
++                 "down": (1, 3, 25), "up": (2, 4, 26)}
++        event_type = types[action][min(button, 2)]
++        event = self.cg.CGEventCreateMouseEvent(None, event_type, CGPoint(*point), button)
++        delta = (point[0] - self.last_point[0], point[1] - self.last_point[1]) if action in ("move", "drag") else (0, 0)
++        self._post(event, point, clicks, delta)
++        self.last_point = point
++
++    def scroll(self, point, wheel_x, wheel_y):
++        # kCGScrollEventUnitLine=1; axis1 vertical, axis2 horizontal.
++        event = self.cg.CGEventCreateScrollWheelEvent2(None, 1, 2, wheel_y, wheel_x, 0)
++        self._post(event, point)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--heads", type=int, default=2)
++    parser.add_argument("--vendor", type=int, default=4102)
++    parser.add_argument("--serial-base", type=int, default=1)
++    parser.add_argument("--report-layout", action="store_true")
++    args = parser.parse_args()
++    if not 1 <= args.heads <= 64 or args.serial_base < 1:
++        parser.error("heads must be 1..64 and serial base must be positive")
++    def interrupted(_number, _frame):
++        raise KeyboardInterrupt()
++    signal.signal(signal.SIGTERM, interrupted)
++    signal.signal(signal.SIGHUP, interrupted)
++    try:
++        pointer = Pointer(MacBackend(), args.heads, args.vendor, args.serial_base)
++        serve(sys.stdin.buffer, sys.stdout, pointer, args.report_layout)
++        return 0
++    except (ValueError, RuntimeError, OSError, KeyboardInterrupt) as error:
++        print("reims-pointer: %s" % (error or "interrupted"), file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/multimonitor/input_probe.swift b/scripts/multimonitor/input_probe.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c2c43c1557b603a4999caf9e48814c2fd71e964
+--- /dev/null
++++ b/scripts/multimonitor/input_probe.swift
+@@ -0,0 +1,88 @@
++// A disposable acceptance surface. Run in the test guest and terminate to close.
++// Writes actual AppKit events to /tmp/reims-input-events.jsonl; never injects input.
++import AppKit
++import CoreGraphics
++
++final class ProbeView: NSView {
++    var head: UInt32 = 0
++    var clicks = 0
++    var marker = NSPoint(x: 100, y: 100)
++    override var acceptsFirstResponder: Bool { true }
++    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
++    override func draw(_ dirtyRect: NSRect) {
++        (head == 0 ? NSColor.systemBlue : NSColor.systemPurple).setFill()
++        bounds.fill()
++        let text = "Reims pointer test — head \(head)\nClicks: \(clicks)\nClick, drag, and scroll here"
++        text.draw(at: NSPoint(x: 30, y: bounds.height - 130), withAttributes: [
++            .font: NSFont.systemFont(ofSize: 26), .foregroundColor: NSColor.white])
++        NSColor.white.setFill()
++        NSBezierPath(ovalIn: NSRect(x: marker.x - 12, y: marker.y - 12,
++                                  width: 24, height: 24)).fill()
++    }
++    func record(_ event: NSEvent, _ action: String) {
++        let point = event.cgEvent?.location ?? .zero
++        // AppKit raises an exception when type-specific properties are read
++        // from another event type (for example scrollingDeltaY on mouseDown).
++        let scrolling = event.type == .scrollWheel
++        let data: [String: Any] = ["head": head, "action": action,
++            "x": point.x, "y": point.y, "clickCount": scrolling ? 0 : event.clickCount,
++            "button": scrolling ? 0 : event.buttonNumber,
++            "wheelX": scrolling ? event.scrollingDeltaX : 0,
++            "wheelY": scrolling ? event.scrollingDeltaY : 0,
++            "modifiers": event.modifierFlags.rawValue]
++        if let json = try? JSONSerialization.data(withJSONObject: data),
++           let line = String(data: json, encoding: .utf8) { if let data = (line + "\n").data(using: .utf8) {
++                let file = URL(fileURLWithPath: "/tmp/reims-input-events.jsonl")
++                if !FileManager.default.fileExists(atPath: file.path) {
++                    FileManager.default.createFile(atPath: file.path, contents: nil)
++                }
++                if let handle = try? FileHandle(forWritingTo: file) {
++                    handle.seekToEndOfFile(); handle.write(data); handle.closeFile()
++                }
++            } }
++        marker = convert(event.locationInWindow, from: nil)
++        needsDisplay = true
++    }
++    override func mouseDown(with e: NSEvent) { clicks += 1; record(e, "down") }
++    override func mouseUp(with e: NSEvent) { record(e, "up") }
++    override func mouseDragged(with e: NSEvent) { record(e, "drag") }
++    override func rightMouseDown(with e: NSEvent) { record(e, "right-down") }
++    override func rightMouseUp(with e: NSEvent) { record(e, "right-up") }
++    override func otherMouseDown(with e: NSEvent) { record(e, "other-down") }
++    override func otherMouseUp(with e: NSEvent) { record(e, "other-up") }
++    override func scrollWheel(with e: NSEvent) { record(e, "scroll") }
++}
++
++final class ProbeDelegate: NSObject, NSApplicationDelegate {
++    var windows: [NSWindow] = []
++    func applicationDidFinishLaunching(_ notification: Notification) {
++        var diagnostics: [[String: Any]] = []
++        for screen in NSScreen.screens {
++            guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
++                  CGDisplayVendorNumber(id.uint32Value) == 4102 else {
++                diagnostics.append(["description": String(describing: screen.deviceDescription)])
++                continue
++            }
++            diagnostics.append(["display": id.uint32Value, "vendor": CGDisplayVendorNumber(id.uint32Value)])
++            let frame = screen.visibleFrame.insetBy(dx: 30, dy: 35)
++            let window = NSWindow(contentRect: frame,
++                                  styleMask: [.titled, .closable, .resizable],
++                                  backing: .buffered, defer: false)
++            let view = ProbeView(frame: NSRect(origin: .zero, size: frame.size))
++            view.head = CGDisplaySerialNumber(id.uint32Value) - 1
++            window.title = "Reims pointer test — head \(view.head)"
++            window.contentView = view
++            window.makeKeyAndOrderFront(nil)
++            windows.append(window)
++        }
++        if let data = try? JSONSerialization.data(withJSONObject: ["windows": windows.count, "screens": diagnostics]) {
++            try? data.write(to: URL(fileURLWithPath: "/tmp/reims-input-ready.json"))
++        }
++        NSApp.activate(ignoringOtherApps: true)
++    }
++}
++let app = NSApplication.shared
++let delegate = ProbeDelegate()
++app.delegate = delegate
++app.setActivationPolicy(.regular)
++withExtendedLifetime(delegate) { app.run() }
+diff --git a/scripts/multimonitor/relay.py b/scripts/multimonitor/relay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..33ca0a532951be3a187c8d69ebb32850fca4d261
+--- /dev/null
++++ b/scripts/multimonitor/relay.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""Relay one local QEMU pointer socket to an explicit macOS SSH companion.
++
++The SSH alias and guest helper path are supplied by the user. Nothing is
++installed and no permission settings are changed. Losing either endpoint
++closes the other, allowing the companion to release held buttons on EOF.
++"""
++import argparse
++import os
++import time
++import selectors
++import shlex
++import signal
++import socket
++import subprocess
++import sys
++
++
++def relay(path, host, helper, heads, serial_base, *, ready_timeout=30, stall_timeout=5, layout_socket=None):
++    args = ['/usr/bin/python3', helper, '--heads', str(heads), '--serial-base', str(serial_base)]
++    if layout_socket:
++        args.append('--report-layout')
++    command = shlex.join(args)
++    process = subprocess.Popen(
++        ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
++         '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2',
++         host, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++        bufsize=0)
++    connection = None
++    layout = None
++    try:
++        os.set_blocking(process.stdout.fileno(), False)
++        os.set_blocking(process.stdin.fileno(), False)
++        with selectors.DefaultSelector() as selector:
++            selector.register(process.stdout, selectors.EVENT_READ)
++            deadline = time.monotonic() + ready_timeout
++            greeting = bytearray()
++            while b"\n" not in greeting:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0 or not selector.select(remaining):
++                    raise RuntimeError('guest companion did not become ready')
++                chunk = os.read(process.stdout.fileno(), 32)
++                if not chunk:
++                    raise RuntimeError('guest companion exited before readiness')
++                greeting.extend(chunk)
++                if len(greeting) > 32 and b"\n" not in greeting:
++                    raise RuntimeError('oversized companion greeting')
++            greeting, _, feedback = greeting.partition(b"\n")
++            greeting += b"\n"
++            if greeting != b'READY 1\n':
++                raise RuntimeError('guest companion refused startup: %r' % greeting)
++            if layout_socket:
++                layout = socket.socket(socket.AF_UNIX)
++                layout.settimeout(1)
++                layout.connect(layout_socket)
++            elif feedback:
++                raise RuntimeError('unexpected companion feedback')
++            feedback = bytearray(feedback)
++
++            def forward_layout():
++                while b"\n" in feedback:
++                    line, _, rest = feedback.partition(b"\n")
++                    del feedback[:len(line) + 1]
++                    if not layout or not line.startswith(b'L 1 ') or len(line) > 4096:
++                        raise RuntimeError('invalid companion layout feedback')
++                    layout.sendall(line + b"\n")
++                if len(feedback) > 4096:
++                    raise RuntimeError('oversized companion layout feedback')
++
++            forward_layout()
++            connection = socket.socket(socket.AF_UNIX)
++            connection.connect(path)
++            connection.sendall(greeting)
++            connection.setblocking(False)
++            selector.register(connection, selectors.EVENT_READ)
++            pending = bytearray()
++            socket_eof = False
++            last_progress = time.monotonic()
++            print('Pointer companion connected; Ctrl-C disconnects.', file=sys.stderr)
++            while True:
++                if pending and time.monotonic() - last_progress >= stall_timeout:
++                    raise RuntimeError('guest companion input stalled')
++                for key, _ in selector.select(1):
++                    if key.fileobj is process.stdout:
++                        data = os.read(process.stdout.fileno(), 4096)
++                        if not data or not layout:
++                            raise RuntimeError('guest companion ended or sent unexpected output: %r' % data)
++                        feedback.extend(data)
++                        forward_layout()
++                        continue
++                    if key.fileobj is connection:
++                        data = connection.recv(4096)
++                        if not data:
++                            selector.unregister(connection)
++                            socket_eof = True
++                            if not pending:
++                                return
++                            continue
++                        if not pending:
++                            last_progress = time.monotonic()
++                            selector.register(process.stdin, selectors.EVENT_WRITE)
++                        pending.extend(data)
++                        if len(pending) > 262144:
++                            raise RuntimeError('guest companion queue exceeded 256 KiB')
++                    else:
++                        try:
++                            written = os.write(process.stdin.fileno(), pending)
++                        except BlockingIOError:
++                            continue
++                        if not written:
++                            raise RuntimeError('guest companion input closed')
++                        del pending[:written]
++                        last_progress = time.monotonic()
++                        if not pending:
++                            selector.unregister(process.stdin)
++                            if socket_eof:
++                                return
++    finally:
++        if connection:
++            connection.close()
++        if layout:
++            layout.close()
++        process.stdin.close()
++        try:
++            process.wait(timeout=3)
++        except subprocess.TimeoutExpired:
++            process.terminate()
++            try:
++                process.wait(timeout=3)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait()
++        process.stdout.close()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--socket', required=True)
++    parser.add_argument('--ssh-host', required=True)
++    parser.add_argument('--guest-helper', required=True)
++    parser.add_argument('--heads', type=int, default=2)
++    parser.add_argument('--serial-base', type=int, default=1)
++    parser.add_argument('--layout-socket')
++    args = parser.parse_args()
++    if not 1 <= args.heads <= 16 or args.serial_base < 1:
++        parser.error('heads must be 1..16 and serial-base positive')
++    if args.ssh_host.startswith('-'):
++        parser.error('ssh-host must be an SSH host or alias')
++    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
++    try:
++        relay(args.socket, args.ssh_host, args.guest_helper, args.heads, args.serial_base, layout_socket=args.layout_socket)
++    except (OSError, RuntimeError, KeyboardInterrupt) as error:
++        print('Pointer relay stopped: %s' % error, file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/scripts/multimonitor/test_guest_pointer.py b/scripts/multimonitor/test_guest_pointer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..acde93f7b06bd7a07f441735342fa709aed31d1f
+--- /dev/null
++++ b/scripts/multimonitor/test_guest_pointer.py
+@@ -0,0 +1,318 @@
++"""CPU-only protocol and desktop-routing tests; never loads Apple frameworks."""
++import io
++import os
++import threading
++import time
++import unittest
++
++from guest_pointer import Display, Pointer, Relative, display_map, parse_packet, position, relative_position, serve, layout_packet
++
++
++class Backend:
++    double_click_interval = 0.5
++
++    def __init__(self):
++        # Deliberately reverse display IDs and enumeration order. Main is not
++        # necessarily the origin, and logical size differs from backing size.
++        self.current = [Display(91, 4102, 2, -720, -100, 720, 1440),
++                        Display(7, 4102, 1, 0, 0, 1920, 1080)]
++        self.events = []
++        self.native_buttons = 0
++        self.native_point = (450, 620)
++
++    def held_buttons(self):
++        return self.native_buttons
++
++    def pointer_position(self):
++        return self.native_point
++
++    def displays(self):
++        return self.current
++
++    def mouse(self, action, button, point, clicks):
++        self.events.append((action, button, point, clicks))
++        self.native_point = point
++        if action == "down":
++            self.native_buttons |= 1 << button
++        elif action == "up":
++            self.native_buttons &= ~(1 << button)
++
++    def scroll(self, point, x, y):
++        self.events.append(("scroll", point, x, y))
++
++
++class LayoutFeedbackTests(unittest.TestCase):
++    def test_bounds_are_identity_ordered(self):
++        mapping = display_map(Backend().current, 2, 4102, 1)
++        self.assertEqual(layout_packet(mapping), "L 1 2 0 0 0 1920 1080 1 -720 -100 720 1440\n")
++
++    def test_idle_layout_change_and_buffered_button_edges(self):
++        backend = Backend()
++        output = io.StringIO()
++        read_fd, write_fd = os.pipe()
++        errors = []
++        def run():
++            try:
++                with os.fdopen(read_fd, 'rb', buffering=0) as stream:
++                    serve(stream, output, Pointer(backend), report_layout=True)
++            except Exception as error:
++                errors.append(error)
++        thread = threading.Thread(target=run)
++        thread.start()
++        try:
++            deadline = time.monotonic() + 2
++            while 'L 1' not in output.getvalue():
++                self.assertLess(time.monotonic(), deadline)
++                time.sleep(.01)
++            backend.current = [Display(7, 4102, 1, 0, 0, 1920, 1080), Display(91, 4102, 2, 1920, 0, 720, 1440)]
++            while '1 1920 0 720 1440' not in output.getvalue():
++                self.assertLess(time.monotonic(), deadline)
++                time.sleep(.01)
++            os.write(write_fd, b'P 1 1 12000 14000 1 0 0\nP 1 1 12000 14000 0 0 0\n')
++        finally:
++            os.close(write_fd)
++            thread.join(timeout=2)
++        self.assertFalse(thread.is_alive())
++        self.assertFalse(errors, errors)
++        self.assertEqual([e[0] for e in backend.events], ['move', 'down', 'drag', 'up'])
++
++
++class ProtocolTests(unittest.TestCase):
++    def test_reset_and_signed_wheels(self):
++        self.assertIsNone(parse_packet(b"R 1\n", 2))
++        self.assertEqual(parse_packet(b"P 1 1 32767 0 31 -4 9\n", 2),
++                         (1, 32767, 0, 31, -4, 9))
++
++    def test_bad_packets_fail_closed(self):
++        for line in [b"", b"R 2\n", b"R 1 x\n", b"P 1 0 0 0 0 0\n",
++                     b"P 2 0 0 0 0 0 0\n", b"P 1 2 0 0 0 0 0\n",
++                     b"P 1 -1 0 0 0 0 0\n", b"P 1 0 32768 0 0 0 0\n",
++                     b"P 1 0 0 -1 0 0 0\n", b"P 1 0 0 0 32 0 0\n",
++                     b"P 1 0 0 0 0 0 32768\n", b"P 1 0 0 0 0 0 -32768\n",
++                     b"P 1 0 0 0 0 0 1.0\n", b"P 1 0 0 0 0 0 1_0\n",
++                     b"P 1 0 0 0 0 0 0", b"\xff\n", b" " * 161 + b"\n"]:
++            with self.subTest(line=line), self.assertRaises(ValueError):
++                parse_packet(line, 2)
++
++
++class GeometryTests(unittest.TestCase):
++    def test_id_order_never_selects_head(self):
++        backend = Backend()
++        mapping = display_map(backend.current, 2, 4102, 1)
++        self.assertEqual(mapping[0].identifier, 7)
++        self.assertEqual(mapping[1].identifier, 91)
++
++    def test_negative_origins_and_inclusive_endpoints(self):
++        display = Backend().current[0]
++        self.assertEqual(position(display, 0, 0), (-720, -100))
++        self.assertEqual(position(display, 32767, 32767), (-1, 1339))
++        x, y = position(display, 16384, 16384)
++        self.assertAlmostEqual(x, -360.5, delta=0.02)
++        self.assertAlmostEqual(y, 619.5, delta=0.03)
++
++    def test_hidpi_uses_desktop_bounds_not_backing_pixels(self):
++        display = Display(1, 4102, 1, 1920, 0, 1280, 720)
++        self.assertEqual(position(display, 32767, 32767), (3199, 719))
++
++    def test_missing_duplicate_and_mirrored_display_rejected(self):
++        original = Backend().current
++        alternatives = [original[:1], original + [original[0]],
++                        [Display(91, 4102, 2, 0, 0, 720, 1440, True), original[1]],
++                        [Display(91, 4102, 2, 0, 0, 0, 1440), original[1]],
++                        [Display(91, 4102, 2, float("nan"), 0, 720, 1440), original[1]],
++                        [Display(7, 4102, 2, 0, 0, 720, 1440), original[1]]]
++        for displays in alternatives:
++            with self.subTest(displays=displays), self.assertRaises(ValueError):
++                display_map(displays, 2, 4102, 1)
++
++
++class RelativeTests(unittest.TestCase):
++    def setUp(self):
++        self.mapping = {0: Display(1, 4102, 1, 0, 0, 1920, 1080),
++                        1: Display(2, 4102, 2, 1920, 0, 720, 1440)}
++
++    def test_signed_protocol(self):
++        self.assertEqual(parse_packet(b"M 1 0 -5 7 1 0 0\n", 2), Relative(0, -5, 7, 1, 0, 0))
++        with self.assertRaises(ValueError):
++            parse_packet(b"M 1 0 -32768 0 0 0 0\n", 2)
++
++    def test_cross_and_return(self):
++        self.assertEqual(relative_position(self.mapping, (1910, 500), 30, 0), (1, (1940, 500)))
++        self.assertEqual(relative_position(self.mapping, (1940, 500), -50, 0), (0, (1890, 500)))
++
++    def test_unmatched_edge_stops_and_slides(self):
++        self.assertEqual(relative_position(self.mapping, (1930, 1200), -40, 20), (1, (1920, 1220)))
++        self.assertEqual(relative_position(self.mapping, (2630, 500), 100, 20), (1, (2639, 520)))
++
++    def test_negative_and_vertical_layout(self):
++        self.mapping[1] = Display(2, 4102, 2, 0, -1440, 720, 1440)
++        self.assertEqual(relative_position(self.mapping, (100, 10), 0, -40), (1, (100, -30)))
++        self.assertEqual(relative_position(self.mapping, (1000, 10), 0, -40), (0, (1000, 0)))
++
++    def test_large_delta_does_not_jump_gap(self):
++        self.mapping[1] = Display(2, 4102, 2, 2000, 0, 720, 1440)
++        self.assertEqual(relative_position(self.mapping, (1910, 500), 500, 0), (0, (1919, 500)))
++
++    def test_drag_keeps_buttons_and_uses_live_arrangement(self):
++        backend = Backend()
++        backend.current = list(self.mapping.values())
++        pointer = Pointer(backend)
++        pointer.accept((0, 32767, 16384, 1, 0, 0))
++        pointer.accept(Relative(0, 30, 0, 1, 0, 0))
++        self.assertEqual(pointer.head, 1)
++        self.assertEqual(backend.events[-1][0], "drag")
++        pointer.accept(Relative(0, 0, 0, 0, 0, 0))
++        self.assertEqual(backend.events[-1][0], "up")
++        self.assertGreater(backend.events[-1][2][0], 1920)
++        backend.current[1] = Display(2, 4102, 2, -720, 0, 720, 1440)
++        pointer.accept((0, 0, 16384, 0, 0, 0))
++        pointer.accept(Relative(0, -30, 0, 0, 0, 0))
++        self.assertEqual(pointer.head, 1)
++        self.assertEqual(pointer.point[0], -30)
++
++
++class StateTests(unittest.TestCase):
++    def setUp(self):
++        self.backend = Backend()
++        self.now = 10.0
++        self.pointer = Pointer(self.backend, clock=lambda: self.now)
++
++    def packet(self, buttons=0, head=0, x=0, y=0, wx=0, wy=0):
++        self.pointer.accept((head, x, y, buttons, wx, wy))
++
++    def test_all_button_edges_and_release_location(self):
++        self.packet(buttons=31, head=1, x=32767, y=32767)
++        down = [e for e in self.backend.events if e[0] == "down"]
++        self.assertEqual([e[1] for e in down], list(range(5)))
++        self.pointer.reset()
++        up = [e for e in self.backend.events if e[0] == "up"]
++        self.assertEqual([e[1] for e in up], list(range(5)))
++        self.assertTrue(all(e[2] == (-1, 1339) for e in up))
++        self.assertEqual(self.pointer.buttons, 0)
++
++    def test_drag_moves_before_release_and_no_repeated_down(self):
++        self.packet(buttons=1)
++        self.packet(buttons=1, x=10000)
++        self.packet(buttons=0, x=32767)
++        self.assertEqual([e[0] for e in self.backend.events],
++                         ["move", "down", "drag", "drag", "up"])
++        self.assertEqual(self.backend.events[-1][2], (1919, 0))
++
++    def test_right_and_middle_drag(self):
++        for button in (1, 2):
++            self.packet(buttons=1 << button)
++            self.packet(buttons=1 << button, x=100)
++            self.assertEqual(self.backend.events[-1][:2], ("drag", button))
++            self.pointer.reset()
++
++    def test_wheel_axes_and_signs_preserved(self):
++        self.packet(head=1, wx=-2, wy=3)
++        self.assertEqual(self.backend.events[-1], ("scroll", (-720, -100), -2, 3))
++
++    def test_double_click_count_on_down_and_up(self):
++        self.packet(buttons=1)
++        self.packet()
++        self.now += 0.2
++        self.packet(buttons=1)
++        self.packet()
++        clicks = [e[3] for e in self.backend.events if e[0] in ("down", "up")]
++        self.assertEqual(clicks, [1, 1, 2, 2])
++        self.now += 1
++        self.packet(buttons=1)
++        self.assertEqual(self.backend.events[-1][3], 1)
++
++    def test_double_click_does_not_cross_heads_or_distance(self):
++        self.packet(buttons=1)
++        self.packet()
++        self.now += 0.1
++        self.packet(buttons=1, head=1)
++        self.assertEqual(self.backend.events[-1][3], 1)
++        self.packet(head=1)
++        self.packet(buttons=1, head=1, x=32767)
++        self.assertEqual(self.backend.events[-1][3], 1)
++
++    def test_drag_returning_to_origin_is_not_double_click(self):
++        self.packet(buttons=1)
++        self.packet(buttons=1, x=32767)
++        self.packet()
++        self.now += 0.1
++        self.packet(buttons=1)
++        self.assertEqual(self.backend.events[-1][3], 1)
++
++    def test_release_attempts_all_buttons_even_if_backend_fails(self):
++        self.packet(buttons=7)
++        original = self.backend.mouse
++        def fail_one(action, button, point, clicks):
++            original(action, button, point, clicks)
++            if action == "up" and button == 0:
++                raise RuntimeError("injected posting failure")
++        self.backend.mouse = fail_one
++        with self.assertRaises(RuntimeError):
++            self.pointer.reset()
++        self.assertEqual([e[1] for e in self.backend.events if e[0] == "up"], [0, 1, 2])
++        self.assertEqual(self.pointer.buttons, 0)
++
++    def test_display_rearrangement_read_on_each_packet(self):
++        self.packet(head=1)
++        self.backend.current[0] = Display(91, 4102, 2, 1920, -300, 1440, 720)
++        self.packet(head=1)
++        self.assertEqual(self.backend.events[-1][2], (1920, -300))
++
++    def test_reset_packet_clears_click_history(self):
++        self.packet(buttons=1)
++        self.pointer.accept(None)
++        self.packet(buttons=1)
++        self.assertEqual(self.backend.events[-1][3], 1)
++
++    def test_eof_releases_buttons_and_readiness_is_only_stdout(self):
++        output = io.StringIO()
++        serve(io.BytesIO(b"R 1\nP 1 1 0 0 5 0 0\n"), output, self.pointer)
++        self.assertEqual(output.getvalue(), "READY 1\n")
++        self.assertEqual(self.pointer.buttons, 0)
++        self.assertEqual([e[1] for e in self.backend.events if e[0] == "up"], [0, 2])
++
++    def test_malformed_or_truncated_packet_releases_buttons(self):
++        for suffix in (b"P 7\n", b"P 1 0", b"a" * 1000):
++            self.backend.events.clear()
++            with self.assertRaises(ValueError):
++                serve(io.BytesIO(b"P 1 0 0 0 1 0 0\n" + suffix), io.StringIO(), self.pointer)
++            self.assertEqual(self.pointer.buttons, 0)
++            self.assertEqual(self.backend.events[-1][0], "up")
++
++    def test_invalid_initial_map_never_announces_readiness(self):
++        self.backend.current = []
++        output = io.StringIO()
++        with self.assertRaises(ValueError):
++            serve(io.BytesIO(), output, self.pointer)
++        self.assertEqual(output.getvalue(), "")
++
++    def test_startup_recovers_native_buttons_from_crashed_helper(self):
++        self.backend.native_buttons = 31
++        self.backend.native_point = (-255, 700)
++        self.assertEqual(self.pointer.buttons, 0)
++        output = io.StringIO()
++        serve(io.BytesIO(), output, self.pointer)
++        self.assertEqual(output.getvalue(), "READY 1\n")
++        self.assertEqual(self.backend.events,
++                         [("up", button, (-255, 700), 1) for button in range(5)])
++        self.assertEqual(self.backend.native_buttons, 0)
++
++    def test_reset_queries_native_state_without_spurious_releases(self):
++        self.pointer.reset()
++        self.assertEqual(self.backend.events, [])
++        self.backend.native_buttons = 18
++        self.backend.native_point = (2000, 650)
++        self.pointer.accept(None)
++        self.assertEqual(self.backend.events,
++                         [("up", 1, (2000, 650), 1), ("up", 4, (2000, 650), 1)])
++
++    def test_hot_unplug_releases_at_last_known_position(self):
++        self.packet(buttons=1, head=1)
++        self.backend.current = []
++        with self.assertRaises(ValueError):
++            serve(io.BytesIO(b"P 1 1 1 1 1 0 0\n"), io.StringIO(), self.pointer)
++        self.assertEqual(self.backend.events[-1], ("up", 0, (-720, -100), 1))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/multimonitor/test_qemu_pointer.py b/scripts/multimonitor/test_qemu_pointer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..217de80ec5bc13d5b07c0aeed4e9747d82316d3c
+--- /dev/null
++++ b/scripts/multimonitor/test_qemu_pointer.py
+@@ -0,0 +1,94 @@
++"""CPU-only QMP integration check for the separately built QEMU bridge."""
++import socket, subprocess, tempfile, json, time, os
++from pathlib import Path
++import argparse
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--qemu', required=True)
++    parser.add_argument('--firmware-dir', required=True)
++    options = parser.parse_args()
++    binary = options.qemu
++    with tempfile.TemporaryDirectory(prefix='reims-pointer-test-') as temp:
++        qpath = temp + '/qmp'
++        ppath = temp + '/pointer'
++        args = [binary, '-machine', 'pc', '-accel', 'tcg', '-m', '64', '-nodefaults', '-device', json.dumps({'driver': 'virtio-gpu-pci', 'id': 'gfx', 'max_outputs': 2}), '-display', 'none', '-S', '-L', options.firmware_dir, '-qmp', f'unix:{qpath},server=on,wait=off', '-chardev', f'socket,id=pointer,path={ppath},server=on,wait=off', '-device', 'reims-pointer,display=gfx,heads=2,chardev=pointer']
++        p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
++        try:
++            for _ in range(100):
++                if Path(qpath).exists():
++                    break
++                if p.poll() is not None:
++                    raise RuntimeError(p.stderr.read().decode())
++                time.sleep(0.05)
++            q = socket.socket(socket.AF_UNIX)
++            q.settimeout(3)
++            q.connect(qpath)
++            f = q.makefile('rwb')
++            f.readline()
++
++            def cmd(c, a=None):
++                f.write((json.dumps({'execute': c, **({'arguments': a} if a else {})}) + '\n').encode())
++                f.flush()
++                while True:
++                    r = json.loads(f.readline())
++                    if 'return' in r:
++                        return r['return']
++                    if 'error' in r:
++                        raise RuntimeError(r)
++            cmd('qmp_capabilities')
++            cmd('cont')
++            s = socket.socket(socket.AF_UNIX)
++            s.settimeout(3)
++            s.connect(ppath)
++            s.sendall(b'READY 1\n')
++            sf = s.makefile('rb')
++            assert sf.readline() == b'R 1\n'
++
++            def events(es):
++                cmd('input-send-event', {'device': 'gfx', 'head': 0, 'events': es})
++            events([{'type': 'abs', 'data': {'axis': 'x', 'value': 16384}}, {'type': 'abs', 'data': {'axis': 'y', 'value': 8192}}])
++            assert sf.readline() == b'P 1 0 16384 8192 0 0 0\n'
++            events([{'type': 'btn', 'data': {'button': 'left', 'down': True}}, {'type': 'btn', 'data': {'button': 'left', 'down': False}}])
++            assert sf.readline() == b'P 1 0 16384 8192 1 0 0\n'
++            assert sf.readline() == b'P 1 0 16384 8192 0 0 0\n'
++            events([{'type': 'btn', 'data': {'button': 'wheel-up', 'down': True}}, {'type': 'btn', 'data': {'button': 'wheel-up', 'down': False}}])
++            assert sf.readline() == b'P 1 0 16384 8192 0 0 1\n'
++            cmd('input-send-event', {'device': 'gfx', 'head': 1, 'events': [{'type': 'abs', 'data': {'axis': 'x', 'value': 24576}}, {'type': 'abs', 'data': {'axis': 'y', 'value': 16384}}]})
++            assert sf.readline() == b'P 1 1 24576 16384 0 0 0\n'
++            events([{'type': 'rel', 'data': {'axis': 'x', 'value': 30}}, {'type': 'rel', 'data': {'axis': 'y', 'value': -5}}])
++            assert sf.readline() == b'M 1 0 30 -5 0 0 0\n'
++            events([{'type': 'btn', 'data': {'button': 'left', 'down': True}}, {'type': 'btn', 'data': {'button': 'left', 'down': False}}])
++            assert sf.readline() == b'M 1 0 0 0 1 0 0\n'
++            assert sf.readline() == b'M 1 0 0 0 0 0 0\n'
++            s.shutdown(socket.SHUT_RDWR)
++            sf.close()
++            s.close()
++            time.sleep(0.1)
++            s = socket.socket(socket.AF_UNIX)
++            s.settimeout(3)
++            s.connect(ppath)
++            s.sendall(b'INVALID\n')
++            assert s.recv(100) == b''
++            s.close()
++            time.sleep(0.1)
++            s = socket.socket(socket.AF_UNIX)
++            s.settimeout(3)
++            s.connect(ppath)
++            s.sendall(b'REA')
++            time.sleep(0.02)
++            s.sendall(b'DY 1\n')
++            assert s.recv(100) == b'R 1\n'
++            s.close()
++            cmd('quit')
++            p.wait(timeout=3)
++            print('PASS: QEMU realize, absolute coordinates, batched click edges, wheel, disconnect, invalid/fragmented greetings')
++        finally:
++            if p.poll() is None:
++                p.terminate()
++                p.wait(timeout=3)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/multimonitor/test_relay.py b/scripts/multimonitor/test_relay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..654b0a08098a0d37724150f61b073f648eae3ba7
+--- /dev/null
++++ b/scripts/multimonitor/test_relay.py
+@@ -0,0 +1,117 @@
++"""Exercise readiness framing and ordered transport with a local helper process."""
++from pathlib import Path
++import socket
++import subprocess
++import sys
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++
++from relay import relay
++
++
++class RelayTests(unittest.TestCase):
++    def helper(self, code):
++        return subprocess.Popen([sys.executable, '-u', '-c', code],
++                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
++
++    def test_fragmented_readiness_and_ordered_button_edges(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = directory + '/pointer'
++            result = directory + '/received'
++            process = self.helper(
++                "import sys,time,pathlib; "
++                "sys.stdout.write('REA');sys.stdout.flush();time.sleep(.03);"
++                "sys.stdout.write('DY 1\\n');sys.stdout.flush();"
++                f"pathlib.Path({result!r}).write_bytes(sys.stdin.buffer.read())")
++            listener = socket.socket(socket.AF_UNIX)
++            listener.bind(path)
++            listener.listen(1)
++            listener.settimeout(3)
++            packets = b'R 1\nP 1 0 200 200 1 0 0\nM 1 0 30 0 1 0 0\nM 1 0 0 0 0 0 0\n'
++            errors = []
++
++            def server():
++                try:
++                    connection, _ = listener.accept()
++                    with connection:
++                        self.assertEqual(connection.recv(32), b'READY 1\n')
++                        connection.sendall(packets)
++                except Exception as error:
++                    errors.append(error)
++
++            thread = threading.Thread(target=server)
++            thread.start()
++            try:
++                with patch('relay.subprocess.Popen', return_value=process):
++                    relay(path, 'guest', '/helper', 2, 1)
++            finally:
++                thread.join(timeout=4)
++                listener.close()
++            self.assertFalse(thread.is_alive())
++            self.assertFalse(errors, errors)
++            self.assertEqual(Path(result).read_bytes(), packets)
++
++    def test_layout_feedback_can_share_readiness_and_arrive_fragmented(self):
++        with tempfile.TemporaryDirectory() as directory:
++            pointer_path = directory + '/pointer'
++            layout_path = directory + '/layout'
++            result = directory + '/received'
++            process = self.helper(
++                "import sys,time,pathlib; "
++                "sys.stdout.write('READY 1\\nL 1 1 0 0 0 ');sys.stdout.flush();time.sleep(.03);"
++                "sys.stdout.write('1920 1080\\n');sys.stdout.flush();"
++                f"pathlib.Path({result!r}).write_bytes(sys.stdin.buffer.read())")
++            listeners = []
++            for path in (pointer_path, layout_path):
++                listener = socket.socket(socket.AF_UNIX)
++                listener.bind(path)
++                listener.listen(1)
++                listener.settimeout(3)
++                listeners.append(listener)
++            received = bytearray()
++            errors = []
++            def server():
++                try:
++                    control, _ = listeners[1].accept()
++                    pointer, _ = listeners[0].accept()
++                    with control, pointer:
++                        control.settimeout(3)
++                        self.assertEqual(pointer.recv(32), b'READY 1\n')
++                        while not received.endswith(b'\n'):
++                            received.extend(control.recv(4096))
++                        pointer.sendall(b'R 1\n')
++                except Exception as error:
++                    errors.append(error)
++            thread = threading.Thread(target=server)
++            thread.start()
++            try:
++                with patch('relay.subprocess.Popen', return_value=process):
++                    relay(pointer_path, 'guest', '/helper', 1, 1, layout_socket=layout_path)
++            finally:
++                thread.join(timeout=4)
++                for listener in listeners:
++                    listener.close()
++            self.assertFalse(thread.is_alive())
++            self.assertFalse(errors, errors)
++            self.assertEqual(received, b'L 1 1 0 0 0 1920 1080\n')
++            self.assertEqual(Path(result).read_bytes(), b'R 1\n')
++
++    def test_partial_readiness_times_out(self):
++        process = self.helper("import sys,time;sys.stdout.write('REA');sys.stdout.flush();time.sleep(10)")
++        with patch('relay.subprocess.Popen', return_value=process):
++            with self.assertRaisesRegex(RuntimeError, 'did not become ready'):
++                relay('/unused', 'guest', '/helper', 2, 1, ready_timeout=.05)
++        self.assertIsNotNone(process.poll())
++
++    def test_invalid_readiness_never_connects(self):
++        process = self.helper("print('NO')")
++        with patch('relay.subprocess.Popen', return_value=process):
++            with self.assertRaisesRegex(RuntimeError, 'refused startup'):
++                relay('/unused', 'guest', '/helper', 2, 1)
++        self.assertIsNotNone(process.poll())
++
++
++if __name__ == '__main__':
++    unittest.main()

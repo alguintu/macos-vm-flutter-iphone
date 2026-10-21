@@ -1,0 +1,13 @@
+[Unit]
+Description=Reserve the macOS VM iPhone only while its VM cgroup is populated
+After=systemd-udevd.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/libexec/macos-vm-usb-@VM@ hold
+ExecStopPost=/usr/local/libexec/macos-vm-usb-@VM@ release
+RuntimeDirectory=macos-vm-usb-@VM@
+RuntimeDirectoryMode=0755
+TimeoutStartSec=45
+TimeoutStopSec=45

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""reims-ctl QEMU wrapper; reads ~/.config/reims-multimonitor.json. Never logs QEMU argv."""
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import sys
+
+
+def transform(args, config):
+    args = list(args)
+    if args.count('-name') != 1 or args[args.index('-name') + 1] != config['vm']:
+        raise ValueError('Unexpected VM name')
+    displays = opencore = 0
+    for i, arg in enumerate(args[:-1]):
+        if arg == '-device' and args[i + 1].startswith(('apple-gfx-pci,', 'apple-gfx-iosurface-pci,')):
+            parts = args[i + 1].split(',')
+            props = dict(part.split('=', 1) for part in parts[1:])
+            props['driver'] = parts[0]
+            if parts[0] == 'apple-gfx-pci':
+                if props.get('id') != 'gfx':
+                    raise ValueError('Expected apple-gfx-pci id=gfx')
+                props.update(displays=2, **{'display-modes': config['modes']})
+                displays += 1
+            args[i + 1] = json.dumps(props)
+        if arg == '-drive' and args[i + 1].startswith('id=opencore,'):
+            parts = dict(p.split('=', 1) for p in args[i + 1].split(','))
+            expected = str(Path.home() / '.local/share/reims-ctl/vms' / config['vm'] / 'opencore.qcow2')
+            if parts != {'id': 'opencore', 'if': 'none', 'format': 'qcow2', 'file': expected}:
+                raise ValueError('Unexpected OpenCore drive; review wrapper for your reims-ctl version')
+            parts.update(format='raw', file=config['opencore'])
+            args[i + 1] = ','.join(k + '=' + v for k, v in parts.items())
+            opencore += 1
+    if displays != 1 or opencore != 1:
+        raise ValueError('Expected exactly one gfx and one OpenCore device')
+    if config.get('snapshot', True):
+        # QEMU's disposable overlays include writable firmware and guest disks.
+        for i, arg in enumerate(args[:-1]):
+            if arg == '-drive' and 'readonly=on' not in args[i + 1]:
+                args[i + 1] += ',snapshot=on'
+    root = Path(config['socket_dir'])
+    args.extend(['-L', config['firmware_dir'],
+                 '-chardev', 'socket,id=reims-pointer,path=' + str(root / 'pointer.sock') + ',server=on,wait=off',
+                 '-device', 'reims-pointer,chardev=reims-pointer,display=gfx,heads=2'])
+    return args
+
+
+def validate(config):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', config['vm']):
+        raise ValueError('Invalid VM name')
+    for key in ('qemu', 'opencore', 'firmware_dir', 'socket_dir', 'snapshot_dir'):
+        value = config[key]
+        if not isinstance(value, str) or not Path(value).is_absolute() or any(c in value for c in ',\n\r\0'):
+            raise ValueError('Use absolute paths without commas/control characters: ' + key)
+    if len(os.fsencode(str(Path(config['socket_dir']) / 'cursor-layout.sock'))) >= 108:
+        raise ValueError('Unix socket path is too long')
+    if not config['modes'] or not all(re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*@[1-9][0-9]*', m) for m in config['modes']):
+        raise ValueError('Expected WxH@Hz display modes')
+    if 'snapshot' in config and not isinstance(config['snapshot'], bool):
+        raise ValueError('snapshot must be a JSON boolean')
+
+
+def main():
+    config = json.loads((Path.home() / '.config/reims-multimonitor.json').read_text())
+    validate(config)
+    args = transform(sys.argv[1:], config)
+    if not os.access(config['qemu'], os.X_OK) or not Path(config['opencore']).is_file():
+        raise ValueError('Build QEMU and prepare the copied OpenCore image first')
+    root = Path(config['socket_dir'])
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode = root.lstat()
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid() or stat.S_IMODE(mode.st_mode) != 0o700:
+        raise ValueError('Socket directory must be a real, private 0700 directory owned by this user')
+    for name in ('pointer.sock', 'cursor-layout.sock'):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            if not stat.S_ISSOCK(path.lstat().st_mode):
+                raise ValueError('Refusing non-socket: ' + str(path))
+            with socket.socket(socket.AF_UNIX) as probe:
+                try:
+                    probe.connect(str(path))
+                except ConnectionRefusedError:
+                    path.unlink()
+                else:
+                    raise ValueError('Socket already active; stop the existing VM/relay first')
+    Path(config['snapshot_dir']).mkdir(parents=True, exist_ok=True)
+    os.environ.update(REIMS_VGPU_EARLY_DISPLAY_PORTS='1', REIMS_VGPU_RELATIVE_POINTER='1',
+                      REIMS_VGPU_HOST_CURSOR_SOCKET=str(root / 'cursor-layout.sock'), TMPDIR=config['snapshot_dir'])
+    os.execv(config['qemu'], [config['qemu'], *args])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, IndexError) as error:
+        sys.exit('Multimonitor launch refused: ' + str(error))

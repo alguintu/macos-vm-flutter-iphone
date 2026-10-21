@@ -1,0 +1,3 @@
+# A blank context line in a unified diff is one space. Check source whitespace
+# after applying the patch; do not treat that required patch marker as an error.
+patches/multimonitor/*.patch whitespace=-blank-at-eol

@@ -1,0 +1,16 @@
+#!/usr/bin/bash
+# Offline packaging checks. Upstream source/build/VM checks are in docs/multimonitor.md.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 -B -m unittest discover -s tests -v
+bash -n scripts/start-vm-limited scripts/install-iphone-port.sh scripts/setup-vm-drive.sh scripts/check
+python3 - <<'PY'
+import ast
+from pathlib import Path
+for root in ('scripts', 'archive', 'tests'):
+    for path in Path(root).rglob('*.py'):
+        ast.parse(path.read_text(), filename=str(path))
+path = Path('scripts/multimonitor/qemu-multimonitor')
+ast.parse(path.read_text(), filename=str(path))
+print('Python and shell syntax: PASS')
+PY

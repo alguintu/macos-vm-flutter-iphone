@@ -1,22 +1,26 @@
 #!/usr/bin/bash
 # Start a reims-ctl macOS VM inside its own cgroup with a kernel-enforced VRAM ceiling.
 #
-#   pkexec /path/to/start-vm-limited [--vm tahoe] [--limit 4G] [--gpu drm/0000:2d:00.0/vram] [--dry-run]
+#   pkexec /path/to/start-vm-limited [--vm tahoe] [--limit 4G] [--gpu drm/0000:2d:00.0/vram]
+#       [--qemu /path/to/qemu-or-wrapper] [--usb-lease] [--dry-run]
 #
 # Why: reims-vgpu's QEMU can hold most of a GPU's VRAM. The dmem cgroup controller
 # caps it. Starting through this script also keeps QEMU out of whatever app or
 # terminal launched it, so closing that app cannot take the VM down with it.
 # Run as root via pkexec or sudo; reims-ctl itself runs as the invoking user.
+# --qemu sets REIMS_CTL_QEMU, so reims-ctl runs that binary or argument wrapper instead.
 set -euo pipefail
 
-vm=tahoe limit=4G region="" dry_run=0
+vm=tahoe limit=4G region="" qemu="" usb_lease=0 dry_run=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vm) vm=$2; shift 2 ;;
         --limit) limit=$2; shift 2 ;;
         --gpu) region=$2; shift 2 ;;
+        --qemu) qemu=$2; shift 2 ;;
+        --usb-lease) usb_lease=1; shift ;;
         --dry-run) dry_run=1; shift ;;
-        -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -49,12 +53,22 @@ pidfile=$home/.local/share/reims-ctl/vms/$vm/qemu.pid
 cg=/sys/fs/cgroup/macos-vm-$vm
 
 if [[ $dry_run == 1 ]]; then
-    printf 'user=%s vm=%s region=%s limit=%s bytes\ncgroup=%s\nwould run: runuser -u %s -- %s start %s\n' \
-        "$user" "$vm" "$region" "$bytes" "$cg" "$user" "$reims" "$vm"
+    printf 'user=%s vm=%s region=%s limit=%s bytes\ncgroup=%s\nqemu=%s\nwould run: runuser -u %s -- %s start %s\n' \
+        "$user" "$vm" "$region" "$bytes" "$cg" "${qemu:-(installed)}" "$user" "$reims" "$vm"
+    printf 'usb_lease=%s\n' "$usb_lease"
     exit 0
 fi
 [[ $EUID -eq 0 ]] || { echo "Run with pkexec or sudo." >&2; exit 1; }
 [[ -x $reims ]] || { echo "reims-ctl not found at $reims" >&2; exit 1; }
+[[ -z $qemu || -x $qemu ]] || { echo "--qemu is not executable: $qemu" >&2; exit 1; }
+
+if [[ $usb_lease == 1 ]]; then
+    [[ $vm =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'USB lease requires a simple VM name.' >&2; exit 2; }
+    lease_user=/etc/macos-vm-usb/$vm.user
+    [[ -r $lease_user && $(cat "$lease_user") == "$user" ]] || {
+        echo "Install the USB lease for this VM/user first (docs/usb-lifecycle.md)." >&2; exit 1;
+    }
+fi
 
 if [[ -f $pidfile ]]; then
     read -r existing <"$pidfile"
@@ -72,12 +86,21 @@ printf '%s %s\n' "$region" "$bytes" >"$cg/dmem.max"
 grep -qx "$region $bytes" "$cg/dmem.max"
 printf '%s\n' "$$" >"$cg/cgroup.procs"
 
+# Start only after this launcher has joined the VM cgroup. Failure/exit empties
+# the cgroup and the service's ExecStopPost restores Fedora ownership.
+if [[ $usb_lease == 1 ]]; then
+    systemctl start "macos-vm-usb-$vm.service"
+fi
+qemu_env=()
+if [[ -n $qemu ]]; then qemu_env=("REIMS_CTL_QEMU=$qemu"); fi
+
 echo "Starting $vm with a ${limit} VRAM ceiling on $region."
 runuser -u "$user" -- env USER="$user" LOGNAME="$user" HOME="$home" \
     PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
     XDG_RUNTIME_DIR="/run/user/$uid" XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}" \
     WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" DISPLAY="${DISPLAY:-:0}" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    "${qemu_env[@]}" \
     "$reims" start "$vm"
 
 read -r pid <"$pidfile"

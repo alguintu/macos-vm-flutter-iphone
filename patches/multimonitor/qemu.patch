@@ -1,0 +1,405 @@
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index de8a240f958b5a85437b96098d895c01ff9e5f92..afc0e9cd263b2afe5eb625cb082a56629cbd8956 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -449,6 +449,7 @@ typedef enum AppleGFXEventKind {
+     APPLE_GFX_EVENT_CURSOR_SHOW,
+     APPLE_GFX_EVENT_CURSOR_MOVE,
+     APPLE_GFX_EVENT_POINTER,
++    APPLE_GFX_EVENT_RELATIVE_POINTER,
+     APPLE_GFX_EVENT_SCROLL,
+     APPLE_GFX_EVENT_KEY,
+     APPLE_GFX_EVENT_CLOSE,
+@@ -468,6 +469,7 @@ struct AppleGFXEvent {
+             uint16_t height;
+             uint32_t buttons;
+         } pointer;
++        struct { double dx, dy; uint32_t buttons; } relative;
+         RvgWindowScroll scroll;
+         struct {
+             uint16_t usage;
+@@ -522,6 +524,29 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
+                                 event->pointer.width, event->pointer.height,
+                                 event->pointer.buttons);
+         break;
++    case APPLE_GFX_EVENT_RELATIVE_POINTER: {
++        static uint32_t button_map[INPUT_BUTTON__MAX] = {
++            [INPUT_BUTTON_LEFT] = RVG_WINDOW_BUTTON_LEFT,
++            [INPUT_BUTTON_RIGHT] = RVG_WINDOW_BUTTON_RIGHT,
++            [INPUT_BUTTON_MIDDLE] = RVG_WINDOW_BUTTON_MIDDLE,
++            [INPUT_BUTTON_SIDE] = RVG_WINDOW_BUTTON_SIDE,
++            [INPUT_BUTTON_EXTRA] = RVG_WINDOW_BUTTON_EXTRA,
++        };
++        AppleGFXState *s = d->state;
++        s->relative_x += event->relative.dx;
++        s->relative_y += event->relative.dy;
++        int dx = (int)CLAMP(s->relative_x, -32767, 32767);
++        int dy = (int)CLAMP(s->relative_y, -32767, 32767);
++        s->relative_x -= dx;
++        s->relative_y -= dy;
++        qemu_input_queue_rel(d->con, INPUT_AXIS_X, dx);
++        qemu_input_queue_rel(d->con, INPUT_AXIS_Y, dy);
++        qemu_input_update_buttons(d->con, button_map, s->input_buttons,
++                                 event->relative.buttons);
++        s->input_buttons = event->relative.buttons;
++        qemu_input_event_sync();
++        break;
++    }
+     case APPLE_GFX_EVENT_SCROLL:
+         apple_gfx_input_scroll(d, &event->scroll);
+         break;
+@@ -820,6 +845,17 @@ static void apple_gfx_window_pointer_cb(void *ctx, uint16_t x, uint16_t y,
+     apple_gfx_event_push(event);
+ }
+ 
++static void apple_gfx_window_relative_pointer_cb(void *ctx, double dx, double dy,
++                                                  uint32_t buttons)
++{
++    AppleGFXEvent *event = apple_gfx_event_new(ctx,
++                                            APPLE_GFX_EVENT_RELATIVE_POINTER);
++    event->relative.dx = dx;
++    event->relative.dy = dy;
++    event->relative.buttons = buttons;
++    apple_gfx_event_push(event);
++}
++
+ static void apple_gfx_window_scroll_cb(void *ctx,
+                                        const RvgWindowScroll *scroll)
+ {
+@@ -1028,6 +1064,9 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+         .close = apple_gfx_window_close_cb,
+         .scroll = apple_gfx_window_scroll_cb,
+     };
++    if (g_strcmp0(getenv("REIMS_VGPU_RELATIVE_POINTER"), "1") == 0) {
++        window_callbacks.relative_pointer = apple_gfx_window_relative_pointer_cb;
++    }
+     /*
+      * Unless display-modes names some, the library offers the resolution
+      * property's mode at 1x or at the density it names, or the host screen's
+diff --git a/hw/display/apple-gfx.h b/hw/display/apple-gfx.h
+index 928638a1bc740afd42883d225f6472cfc995788e..1cee12412b46640c1ad9f7685570004232bc6b1e 100644
+--- a/hw/display/apple-gfx.h
++++ b/hw/display/apple-gfx.h
+@@ -92,6 +92,7 @@ struct AppleGFXState {
+     QEMUBH *event_bh;
+ 
+     /* Mutable state (BQL protected) */
++    double relative_x, relative_y; /* fractional relative host motion */
+     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
+ };
+ 
+diff --git a/hw/input/meson.build b/hw/input/meson.build
+index 90a214962c7c97d33a8297a3fa902aebd6e7b35b..2cf2a3b8d8f49304777a4d3e14e7ef8a09c10d96 100644
+--- a/hw/input/meson.build
++++ b/hw/input/meson.build
+@@ -1,4 +1,5 @@
+ system_ss.add(files('hid.c'))
++system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'], if_true: files('reims-pointer.c'))
+ system_ss.add(when: 'CONFIG_ADB', if_true: files('adb.c', 'adb-mouse.c', 'adb-kbd.c'))
+ system_ss.add(when: 'CONFIG_PCKBD', if_true: files('pckbd.c'))
+ system_ss.add(when: 'CONFIG_PL050', if_true: files('pl050.c'))
+diff --git a/hw/input/reims-pointer.c b/hw/input/reims-pointer.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..016072813851791b700754ca6440af16439176ef
+--- /dev/null
++++ b/hw/input/reims-pointer.c
+@@ -0,0 +1,299 @@
++/*
++ * Display-addressed pointing for a guest companion. The USB tablet protocol
++ * carries no display identity; a macOS guest maps it to its current screen.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "chardev/char-fe.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "migration/vmstate.h"
++#include "qom/object.h"
++#include "system/system.h"
++#include "ui/console.h"
++#include "ui/input.h"
++
++#define TYPE_REIMS_POINTER "reims-pointer"
++#define REIMS_POINTER_MAX_HEADS 16
++OBJECT_DECLARE_SIMPLE_TYPE(ReimsPointer, REIMS_POINTER)
++
++typedef struct PointerHead {
++    QemuInputHandlerState *handler;
++    int x, y;
++    int dx, dy;
++    bool relative;
++    int wheel_x, wheel_y;
++    bool dirty;
++} PointerHead;
++
++struct ReimsPointer {
++    DeviceState parent_obj;
++    CharFrontend chr;
++    char *display;
++    uint32_t heads;
++    PointerHead head[REIMS_POINTER_MAX_HEADS];
++    uint32_t buttons;
++    char greeting[16];
++    unsigned greeting_len;
++    bool ready;
++    Notifier machine_done;
++    bool awaiting_machine;
++};
++
++/* Never wait for a companion under QEMU's main-loop lock. A broken or slow
++ * stream disconnects, so its EOF cleanup releases the guest's held buttons.
++ */
++static bool pointer_write(ReimsPointer *s, const char *line)
++{
++    size_t len = strlen(line);
++    if (qemu_chr_fe_write(&s->chr, (const uint8_t *)line, len) != len) {
++        s->ready = false;
++        qemu_chr_fe_disconnect(&s->chr);
++        warn_report("reims-pointer: disconnected after a short write");
++        return false;
++    }
++    return true;
++}
++
++static void pointer_flush(ReimsPointer *s, unsigned head)
++{
++    PointerHead *h = &s->head[head];
++    char line[128];
++
++    if (h->dirty && s->ready) {
++        snprintf(line, sizeof(line), "%c 1 %u %d %d %u %d %d\n",
++                 h->relative ? 'M' : 'P', head,
++                 h->relative ? h->dx : h->x,
++                 h->relative ? h->dy : h->y,
++                 s->buttons, h->wheel_x, h->wheel_y);
++        pointer_write(s, line);
++    }
++    h->dirty = false;
++    h->wheel_x = h->wheel_y = 0;
++    h->dx = h->dy = 0;
++}
++
++static void pointer_event(DeviceState *dev, QemuConsole *src,
++                          QemuInputEvent *event)
++{
++    ReimsPointer *s = REIMS_POINTER(dev);
++    unsigned head = src ? qemu_console_get_head(src) : 0;
++    PointerHead *h;
++    unsigned bit;
++
++    if (!s->ready || head >= s->heads) {
++        return;
++    }
++    h = &s->head[head];
++    if (event->type == INPUT_EVENT_KIND_REL) {
++        h->relative = true;
++        if (event->rel.axis == INPUT_AXIS_X) {
++            h->dx = CLAMP(h->dx + (int64_t)event->rel.value, -32767, 32767);
++        } else if (event->rel.axis == INPUT_AXIS_Y) {
++            h->dy = CLAMP(h->dy + (int64_t)event->rel.value, -32767, 32767);
++        }
++        h->dirty = true;
++        return;
++    }
++    if (event->type == INPUT_EVENT_KIND_ABS) {
++        h->relative = false;
++        int value = CLAMP(event->abs.value, 0, INPUT_EVENT_ABS_MAX);
++        if (event->abs.axis == INPUT_AXIS_X) {
++            h->x = value;
++        } else if (event->abs.axis == INPUT_AXIS_Y) {
++            h->y = value;
++        }
++        h->dirty = true;
++        return;
++    }
++    if (event->type != INPUT_EVENT_KIND_BTN) {
++        return;
++    }
++    switch (event->btn.button) {
++    case INPUT_BUTTON_LEFT: bit = 0; break;
++    case INPUT_BUTTON_RIGHT: bit = 1; break;
++    case INPUT_BUTTON_MIDDLE: bit = 2; break;
++    case INPUT_BUTTON_SIDE: bit = 3; break;
++    case INPUT_BUTTON_EXTRA: bit = 4; break;
++    case INPUT_BUTTON_WHEEL_UP:
++    case INPUT_BUTTON_WHEEL_DOWN:
++    case INPUT_BUTTON_WHEEL_LEFT:
++    case INPUT_BUTTON_WHEEL_RIGHT:
++        if (event->btn.down) {
++            h->wheel_y += (event->btn.button == INPUT_BUTTON_WHEEL_UP) -
++                          (event->btn.button == INPUT_BUTTON_WHEEL_DOWN);
++            h->wheel_x += (event->btn.button == INPUT_BUTTON_WHEEL_LEFT) -
++                          (event->btn.button == INPUT_BUTTON_WHEEL_RIGHT);
++            h->dirty = true;
++            pointer_flush(s, head);
++        }
++        return;
++    default:
++        return;
++    }
++    if (event->btn.down) {
++        s->buttons |= 1u << bit;
++    } else {
++        s->buttons &= ~(1u << bit);
++    }
++    h->dirty = true;
++    /* A press and release in one input batch must remain two events. */
++    pointer_flush(s, head);
++}
++
++static void pointer_sync(DeviceState *dev)
++{
++    ReimsPointer *s = REIMS_POINTER(dev);
++    for (unsigned i = 0; i < s->heads; ++i) {
++        pointer_flush(s, i);
++    }
++}
++
++static const QemuInputHandler pointer_handler = {
++    .name = "Reims display-addressed pointer",
++    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_BTN,
++    .event = pointer_event,
++    .sync = pointer_sync,
++};
++
++static int pointer_can_read(void *opaque)
++{
++    return 16;
++}
++
++static void pointer_read(void *opaque, const uint8_t *buf, int size)
++{
++    ReimsPointer *s = opaque;
++    for (int i = 0; i < size; ++i) {
++        if (s->ready || s->greeting_len >= sizeof(s->greeting) - 1) {
++            s->ready = false;
++            qemu_chr_fe_disconnect(&s->chr);
++            return;
++        }
++        s->greeting[s->greeting_len++] = buf[i];
++        if (buf[i] == '\n') {
++            s->greeting[s->greeting_len] = 0;
++            if (strcmp(s->greeting, "READY 1\n") != 0) {
++                qemu_chr_fe_disconnect(&s->chr);
++                return;
++            }
++            s->ready = pointer_write(s, "R 1\n");
++        }
++    }
++}
++
++static void pointer_chr_event(void *opaque, QEMUChrEvent event)
++{
++    ReimsPointer *s = opaque;
++    if (event != CHR_EVENT_OPENED && event != CHR_EVENT_CLOSED) {
++        return;
++    }
++    s->ready = false;
++    s->greeting_len = 0;
++    s->buttons = 0;
++    for (unsigned i = 0; i < s->heads; ++i) {
++        s->head[i].dirty = false;
++        s->head[i].dx = s->head[i].dy = 0;
++        s->head[i].relative = false;
++        s->head[i].wheel_x = s->head[i].wheel_y = 0;
++    }
++}
++
++static void pointer_unrealize(DeviceState *dev)
++{
++    ReimsPointer *s = REIMS_POINTER(dev);
++    if (s->awaiting_machine) {
++        qemu_remove_machine_init_done_notifier(&s->machine_done);
++        s->awaiting_machine = false;
++    }
++    for (unsigned i = 0; i < s->heads; ++i) {
++        if (s->head[i].handler) {
++            qemu_input_handler_unregister(s->head[i].handler);
++            s->head[i].handler = NULL;
++        }
++    }
++    qemu_chr_fe_disconnect(&s->chr);
++    qemu_chr_fe_deinit(&s->chr, false);
++}
++
++static void pointer_machine_done(Notifier *notifier, void *data)
++{
++    ReimsPointer *s = container_of(notifier, ReimsPointer, machine_done);
++    DeviceState *dev = DEVICE(s);
++    for (unsigned i = 0; i < s->heads; ++i) {
++        Error *local_err = NULL;
++        s->head[i].handler = qemu_input_handler_register(dev, &pointer_handler);
++        qemu_input_handler_bind(s->head[i].handler, s->display, i, &local_err);
++        if (local_err) {
++            pointer_unrealize(dev);
++            error_report_err(local_err);
++            exit(EXIT_FAILURE);
++        }
++        qemu_input_handler_activate(s->head[i].handler);
++    }
++    qemu_chr_fe_set_handlers(&s->chr, pointer_can_read, pointer_read,
++                             pointer_chr_event, NULL, s, NULL, true);
++}
++
++static void pointer_realize(DeviceState *dev, Error **errp)
++{
++    ReimsPointer *s = REIMS_POINTER(dev);
++    if (!s->display || !s->heads || s->heads > REIMS_POINTER_MAX_HEADS ||
++        !qemu_chr_fe_backend_connected(&s->chr)) {
++        error_setg(errp, "reims-pointer requires display, chardev and 1..16 heads");
++        return;
++    }
++    /* A file/pipe/stdio backend has no connection close with which the
++     * companion can detect a broken stream and release held buttons.
++     */
++    if (!object_dynamic_cast(OBJECT(qemu_chr_fe_get_driver(&s->chr)),
++                             TYPE_CHARDEV_SOCKET)) {
++        error_setg(errp, "reims-pointer requires a socket chardev");
++        return;
++    }
++    /* JSON and keyval -device options may realize in different groups.
++     * Resolve consoles only after every display device has been created.
++     */
++    s->machine_done.notify = pointer_machine_done;
++    s->awaiting_machine = true;
++    qemu_add_machine_init_done_notifier(&s->machine_done);
++}
++
++static const Property pointer_properties[] = {
++    DEFINE_PROP_CHR("chardev", ReimsPointer, chr),
++    DEFINE_PROP_STRING("display", ReimsPointer, display),
++    DEFINE_PROP_UINT32("heads", ReimsPointer, heads, 1),
++};
++
++static const VMStateDescription pointer_vmstate = {
++    .name = TYPE_REIMS_POINTER,
++    .unmigratable = true,
++};
++
++static void pointer_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->desc = "Display-addressed pointer for the Reims guest companion";
++    dc->realize = pointer_realize;
++    dc->unrealize = pointer_unrealize;
++    dc->hotpluggable = false;
++    dc->vmsd = &pointer_vmstate;
++    device_class_set_props(dc, pointer_properties);
++}
++
++static const TypeInfo pointer_info = {
++    .name = TYPE_REIMS_POINTER,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(ReimsPointer),
++    .class_init = pointer_class_init,
++};
++
++static void pointer_register_types(void)
++{
++    type_register_static(&pointer_info);
++}
++type_init(pointer_register_types)

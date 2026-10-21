@@ -1,0 +1,92 @@
+#!/usr/bin/python3
+"""Root-owned macOS VM USB lease, bounded by the VM cgroup's lifetime."""
+import os
+from pathlib import Path
+import select
+import socket
+import subprocess
+import sys
+
+CGROUP = Path('/sys/fs/cgroup/macos-vm-@VM@')
+ACTIVE = Path('/run/macos-vm-usb-@VM@/active')
+
+
+def run(*args):
+    return subprocess.run(args, check=True, timeout=20)
+
+
+def phones():
+    for path in Path('/sys/bus/usb/devices').glob('*-@PORT@'):
+        try:
+            if ((path / 'idVendor').read_text().strip() == '@VID@'
+                    and (path / 'idProduct').read_text().strip() == '@PID@'
+                    and '@CONTROLLER@' in path.resolve().parts):
+                yield path
+        except FileNotFoundError:
+            continue
+
+
+def refresh(action):
+    found = list(phones())
+    for path in found:
+        if not path.exists():
+            continue
+        run('/usr/bin/udevadm', 'trigger', '--action=' + action, str(path))
+        run('/usr/bin/udevadm', 'settle', '--timeout=10')
+        for interface in path.parent.glob(path.name + ':*'):
+            if interface.exists():
+                run('/usr/bin/udevadm', 'trigger', '--action=' + action, str(interface))
+    run('/usr/bin/udevadm', 'settle', '--timeout=10')
+    return found
+
+
+def populated(stream):
+    stream.seek(0)
+    return 'populated 1' in stream.read().splitlines()
+
+
+def notify_ready():
+    address = os.environ['NOTIFY_SOCKET']
+    if address.startswith('@'):
+        address = '\0' + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.sendto(b'READY=1\nSTATUS=iPhone reserved until macOS VM cgroup empties', address)
+
+
+def hold():
+    with (CGROUP / 'cgroup.events').open() as events:
+        if not populated(events):
+            raise SystemExit('macOS VM cgroup is empty; refusing to reserve USB')
+        ACTIVE.write_text('macOS VM USB lease\n')
+        found = refresh('change')
+        if found:
+            # Close any already-open host handles. Other device access rules stay
+            # unchanged; the reserved node now denies usbmuxd when it rescans.
+            run('/usr/bin/systemctl', 'try-restart', 'usbmuxd.service')
+        notify_ready()
+        poller = select.poll()
+        poller.register(events.fileno(), select.POLLPRI | select.POLLERR)
+        while populated(events):
+            poller.poll(5000)
+    # systemd runs release via ExecStopPost, including after a failed start/crash.
+
+
+def release():
+    ACTIVE.unlink(missing_ok=True)
+    # An add event re-applies Fedora's normal usbmuxd ownership/configuration
+    # rules, which intentionally do not run on a plain change event.
+    if refresh('add'):
+        # A running daemon may have cached its denied-open result while leased.
+        # Restart so it actually reopens the now-accessible USB device.
+        run('/usr/bin/systemctl', 'restart', 'usbmuxd.service')
+    print('macOS VM USB lease released; Fedora device rules restored.', flush=True)
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2 or sys.argv[1] not in ('hold', 'release'):
+        raise SystemExit('Expected root: macos-vm-usb-@VM@ hold|release')
+    (hold if sys.argv[1] == 'hold' else release)()
+
+
+if __name__ == '__main__':
+    main()

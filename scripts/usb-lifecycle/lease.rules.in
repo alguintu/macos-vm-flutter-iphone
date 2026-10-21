@@ -1,0 +1,16 @@
+# Only the iPhone on chipset controller @CONTROLLER@, direct socket @PORT@.
+# /run lease is root-owned and removed when macOS VM exits or the host reboots.
+SUBSYSTEM!="usb", GOTO="macos_vm_usb_end"
+ENV{DEVTYPE}=="usb_device", KERNELS=="@CONTROLLER@", KERNEL=="*-@PORT@", ATTR{idVendor}=="@VID@", ATTR{idProduct}=="@PID@", GOTO="macos_vm_usb_parent"
+ENV{DEVTYPE}=="usb_interface", ENV{DEVPATH}=="*/@CONTROLLER@/usb*/*-@PORT@/*-@PORT@:*", ATTRS{idVendor}=="@VID@", ATTRS{idProduct}=="@PID@", GOTO="macos_vm_usb_interface"
+GOTO="macos_vm_usb_end"
+
+LABEL="macos_vm_usb_parent"
+TEST!="/run/macos-vm-usb-@VM@/active", ENV{MTP_NO_PROBE}="", GOTO="macos_vm_usb_end"
+OWNER:="root", GROUP:="root", MODE:="0600", ENV{USBMUX_SUPPORTED}="0", ENV{SYSTEMD_WANTS}="", ENV{ID_GPHOTO2}="", ENV{GPHOTO2_DRIVER}="", ENV{ID_MTP_DEVICE}="", ENV{MTP_NO_PROBE}="1", ENV{COLORD_DEVICE}="", ENV{COLORD_KIND}="", RUN+="/usr/bin/setfacl -m u:@USER@:rw $env{DEVNAME}"
+GOTO="macos_vm_usb_end"
+
+LABEL="macos_vm_usb_interface"
+TEST!="/run/macos-vm-usb-@VM@/active", ENV{MTP_NO_PROBE}="", GOTO="macos_vm_usb_end"
+ENV{ID_GPHOTO2}="", ENV{GPHOTO2_DRIVER}="", ENV{ID_MTP_DEVICE}="", ENV{MTP_NO_PROBE}="1", ENV{COLORD_DEVICE}="", ENV{COLORD_KIND}=""
+LABEL="macos_vm_usb_end"
