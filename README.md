@@ -8,6 +8,10 @@ A macOS Tahoe virtual machine on Fedora for building Flutter/iOS apps and runnin
 
 **Procedure: [runbook.md](runbook.md).** Read its "Known failures" section before trying alternatives.
 
+For SSH-controlled development with the app visible on the physical phone, see
+[headless iPhone development](docs/headless.md). The macOS desktop session stays
+logged in for signing while Reims opens no host window.
+
 **2026-10-22 progress:** [two displays and responsive border crossing](docs/multimonitor.md), with pinned source patches, a hash-checked OpenCore copy patcher, the guest-aware mouse companion, and opt-in launcher. Physical feedback on the reference host: **visible, aligned, lighter, workable**. The [USB lifecycle recipe](docs/usb-lifecycle.md) replaces permanent socket reservation. Normal single-display launch remains rollback; the experimental wrapper defaults to disposable disk snapshots.
 
 ## Contents
