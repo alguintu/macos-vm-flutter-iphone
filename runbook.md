@@ -2,7 +2,7 @@
 
 Repeatable procedure for building, running and repairing the VM, written so another person or agent can pick it up cold. Everything here was performed and verified on the [reference machine](README.md#reference-machine-tested-2026-10-21) on 2026-10-21 unless marked otherwise. Read [Known failures](#known-failures) before improvising.
 
-**2026-10-22 follow-up:** the original procedure below is the single-display baseline. For the accepted dual-display mouse candidate use [multimonitor.md](docs/multimonitor.md); for automatic USB return on VM exit use [usb-lifecycle.md](docs/usb-lifecycle.md), which supersedes permanent reservation in section 7. The iPhone Simulator has since booted and displayed on the second monitor; full compatibility is still unverified.
+**2026-10-22 follow-up:** the original procedure below is the single-display baseline. For the accepted dual-display mouse candidate use [multimonitor.md](docs/multimonitor.md); for automatic USB return on VM exit use [usb-lifecycle.md](docs/usb-lifecycle.md), which supersedes permanent reservation in section 7. The iPhone Simulator has since booted and displayed on the second monitor; full compatibility is still unverified. Before using a simulator device, disable its `mediaanalysisd` as described in [simulator.md](docs/simulator.md), or it holds 6–8 host CPU cores.
 
 Conventions: **Host** = Fedora shell as your normal user. **Guest (SSH)** = `ssh tahoe '…'`. **Guest (desktop)** = Terminal.app in the VM window. Steps that need a password say whose: host sudo, Mac account, or Apple Account. Agents should hand password steps to the human in a terminal and never type them.
 
@@ -200,6 +200,8 @@ Do not repeat these without new evidence.
 | VFIO of a whole USB controller | Works in principle, but takes every socket on that controller from the host, and chipset controllers usually share IOMMU groups with storage and network |
 | Signing or `flutter run` over SSH | "User interaction is not allowed" (keychain); use the guest desktop session |
 | Headless Android emulator on the same host without `-gpu host` | Bundled SwiftShader segfaults about 20 s in (unrelated to macOS, but bites on the same machines) |
+| Leaving a fresh iOS 26.5 simulator to "settle" | Its `mediaanalysisd` runs CPU text-embedding inference at 600–700% for minutes. Disable it per device ([simulator.md](docs/simulator.md)); do not disable other simulator daemons |
+| `plutil -replace` on a simulator's `disabled.plist` | Reads the dots in launchd labels as a key path and fails; use PlistBuddy |
 | `pkill -f <pattern>` from an agent shell | Matches the agent's own command line; kill by PID |
 
 ## Rollback

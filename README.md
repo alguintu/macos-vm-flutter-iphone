@@ -28,13 +28,14 @@ logged in for signing while Reims opens no host window.
 | [patches/multimonitor/](patches/multimonitor/) | Pinned Reims/QEMU source patches and provenance |
 | [scripts/multimonitor/](scripts/multimonitor/) | Fresh source preparation, copied OpenCore patching and opt-in QEMU wrapper |
 | [docs/usb-lifecycle.md](docs/usb-lifecycle.md) | VM-lifetime USB lease, reviewable templates, install and physical checks |
+| [docs/simulator.md](docs/simulator.md) | Fix the iOS Simulator's sustained 600% CPU (`mediaanalysisd`), with diagnosis and verification |
 | [scripts/check](scripts/check) | Local packaging tests and syntax checks; no VM or privileged changes |
 | [archive/](archive/) | A usbmux relay approach that did **not** work, kept for reference |
 
 ## Limits
 
 - **Intel sunset.** Xcode 27 and later are Apple-silicon only, and Homebrew has dropped Intel Macs. When Apple starts requiring the Xcode 27 SDK for App Store uploads (historically each April), this VM can still build and test but can no longer publish. Plan an Apple silicon Mac or hosted macOS CI before then.
-- **Metal 2 only.** The guest has no Metal 3. An iPhone Simulator boot and pixels on the second display were verified locally; broad Simulator compatibility is untested.
+- **Metal 2 only.** The guest has no Metal 3. An iPhone Simulator boot and pixels on the second display were verified locally; broad Simulator compatibility is untested. Each simulator device needs [one daemon disabled](docs/simulator.md) or it holds 6–8 host cores.
 - **Free signing.** A free Apple Account's Personal Team signs 7-day development profiles; rebuild to renew.
 - **One socket.** The selected USB socket hands only the iPhone (`05ac:12a8`) to the VM. With the temporary lease, it returns on VM exit; other device identities stay with the host.
 
