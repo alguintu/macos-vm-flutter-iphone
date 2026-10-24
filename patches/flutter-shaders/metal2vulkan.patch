@@ -1,0 +1,113 @@
+diff --git a/crates/metal2vulkan-air/src/abi/module.rs b/crates/metal2vulkan-air/src/abi/module.rs
+index 2ee42b3..889af8f 100644
+--- a/crates/metal2vulkan-air/src/abi/module.rs
++++ b/crates/metal2vulkan-air/src/abi/module.rs
+@@ -322,7 +322,8 @@ fn plain_signature(n: &mut Ops<'_>, site: &Site) -> Result<LinkageSignature, Err
+ }
+ 
+ /// `!llvm.module.flags`: `!{i32 <behavior>, !"<key>", <value>}`. The `air.max_*` limits are
+-/// decoded; `wchar_size`, `frame-pointer`, and `SDK Version` are LLVM's and carry nothing the
++/// decoded; `wchar_size`, `frame-pointer`, `SDK Version`, `Dwarf Version` and `Debug Info Version`
++/// are LLVM's and carry nothing the
+ /// translation reads; `air.workaround.sampler_state_variable_length_encoding` (an `i1`) names the
+ /// form of the module's constexpr sampler words, which each `air.sampler_state` global's own type
+ /// states; any other flag is unknown.
+@@ -346,7 +347,11 @@ fn module_flags(
+             b"air.max_textures" => &mut l.max_textures,
+             b"air.max_read_write_textures" => &mut l.max_read_write_textures,
+             b"air.max_samplers" => &mut l.max_samplers,
+-            b"wchar_size" | b"frame-pointer" | b"SDK Version" => {
++            // `Dwarf Version` and `Debug Info Version` are LLVM's debug-info flags: AIR built with
++            // line tables (Flutter's Impeller shaders are) carries them, and they describe the
++            // debug metadata, not anything the translation reads.
++            b"wchar_size" | b"frame-pointer" | b"SDK Version" | b"Dwarf Version"
++            | b"Debug Info Version" => {
+                 n.next(key)?;
+                 n.finish()?;
+                 continue;
+diff --git a/crates/metal2vulkan/src/memory/plan.rs b/crates/metal2vulkan/src/memory/plan.rs
+index 2045134..c8ccf58 100644
+--- a/crates/metal2vulkan/src/memory/plan.rs
++++ b/crates/metal2vulkan/src/memory/plan.rs
+@@ -895,7 +895,19 @@ impl Planner<'_> {
+                 },
+                 wide: self.wide_access(&u),
+                 atomic: u.atomic,
+-                window: escaped_window(window::window(u.extent, arg.buffer_size, dynamic), &u),
++                // A device reference's `air.buffer_size` is its pointee's nominal size, and a
++                // trailing one-element array is how SPIRV-Cross (impellerc, MoltenVK's peers)
++                // spells a runtime array: Metal reads past it into the bound buffer. Only a
++                // constant reference bounds its dynamic accesses; a device one is contained by
++                // its binding's own extent.
++                window: escaped_window(
++                    window::window(
++                        u.extent,
++                        arg.buffer_size.filter(|_| arg.space == AddrSpace::Constant),
++                        dynamic,
++                    ),
++                    &u,
++                ),
+                 guest_base: u.escapes || u.cross_compare,
+             });
+         }
+diff --git a/crates/metal2vulkan/src/memory/plan/tests.rs b/crates/metal2vulkan/src/memory/plan/tests.rs
+index 1711e51..c02e1e4 100644
+--- a/crates/metal2vulkan/src/memory/plan/tests.rs
++++ b/crates/metal2vulkan/src/memory/plan/tests.rs
+@@ -305,27 +305,30 @@ fn struct_and_array_geps_and_negative_offsets_give_hand_computed_windows() {
+     assert_eq!(plan.slots.first().map(|s| s.access), Some(AccessSet::READ));
+ }
+ 
+-/// A dynamic index makes the offset unknown: `Whole` for an unsized pointer, `[0, buffer_size)`
+-/// for a reference parameter (`air.buffer_size`).
++/// A dynamic index makes the offset unknown: `Whole` for an unsized pointer and for a `device`
++/// reference (its trailing `T[1]` may be a runtime array, SPIRV-Cross's spelling of one), and
++/// `[0, buffer_size)` for a `constant` reference (`air.buffer_size`).
+ #[test]
+-fn a_dynamic_index_is_whole_unless_the_parameter_is_a_sized_reference() {
+-    for (size, want) in [
+-        (None, Window::Whole),
+-        (Some(64), Window::Bounded { start: 0, len: 64 }),
++fn a_dynamic_index_is_whole_unless_the_parameter_is_a_sized_constant_reference() {
++    for (space, size, want) in [
++        (AddrSpace::Device, None, Window::Whole),
++        (AddrSpace::Device, Some(64), Window::Whole),
++        (AddrSpace::Constant, None, Window::Whole),
++        (AddrSpace::Constant, Some(64), Window::Bounded { start: 0, len: 64 }),
+     ] {
+         let mut k = Kernel::new();
+-        k.param(AddrSpace::Device, buffer(0, AddrSpace::Device, size));
++        k.param(space, buffer(0, space, size));
+         k.param(AddrSpace::Device, buffer(1, AddrSpace::Device, None));
+         let e = k.build(|fb| {
+             let i32t = fb.module().int(32);
+             let i = load(fb, i32t, fb.arg(1));
+             let p = gep(fb, i32t, fb.arg(0), &[i]);
+-            let v = fb.module().const_int(i32t, 1);
+-            store(fb, v, p);
++            let v = load(fb, i32t, p);
++            store(fb, v, fb.arg(1));
+             fb.ret(None);
+         });
+         let plan = ok(&e);
+-        assert_eq!(window_of(&plan, 0), Some(want));
++        assert_eq!(window_of(&plan, 0), Some(want), "{space:?} {size:?}");
+         assert_eq!(
+             window_of(&plan, 1),
+             Some(Window::Bounded { start: 0, len: 4 })
+diff --git a/crates/metal2vulkan/src/memory/window.rs b/crates/metal2vulkan/src/memory/window.rs
+index 93340c8..c36f979 100644
+--- a/crates/metal2vulkan/src/memory/window.rs
++++ b/crates/metal2vulkan/src/memory/window.rs
+@@ -9,8 +9,9 @@
+ //! - Otherwise, when every access has a constant offset range and length, the window is the hull
+ //!   of the accessed bytes (it may start below zero: negative GEPs are Metal-defined when they
+ //!   stay inside the allocation).
+-//! - Otherwise a reference parameter (`air.buffer_size`: a sized pointee, `constant T&`) bounds
+-//!   its Metal-defined accesses to `[0, buffer_size)`; a constant access outside the object is
++//! - Otherwise a `constant` reference parameter (`air.buffer_size`: a sized pointee, `constant T&`)
++//!   bounds its Metal-defined accesses to `[0, buffer_size)` (a `device` reference does not: its
++//!   trailing `T[1]` may be a runtime array, which `memory::plan` passes no size for); a constant access outside the object is
+ //!   not Metal-defined and is contained, not covered. `air.arg_type_size` does not bound anything:
+ //!   it is the pointee *element* size of an unsized pointer parameter too.
+ //! - Otherwise `Whole`.

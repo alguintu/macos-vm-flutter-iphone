@@ -16,6 +16,10 @@ logged in for signing while Reims opens no host window.
 
 ## Contents
 
+**Flutter Simulator rendering:** the [shader fixes and continuation guide](docs/flutter-shaders.md)
+package the LLVM metadata and black-gradient fixes, with pinned source, build
+instructions, test limits and a workflow for investigating further shader issues.
+
 | Path | Purpose |
 | --- | --- |
 | [runbook.md](runbook.md) | Setup from a bare Fedora host, daily use, acceptance checks, known failures, rollback |
@@ -29,6 +33,8 @@ logged in for signing while Reims opens no host window.
 | [scripts/multimonitor/](scripts/multimonitor/) | Fresh source preparation, copied OpenCore patching and opt-in QEMU wrapper |
 | [docs/usb-lifecycle.md](docs/usb-lifecycle.md) | VM-lifetime USB lease, reviewable templates, install and physical checks |
 | [docs/simulator.md](docs/simulator.md) | Fix the iOS Simulator's sustained 600% CPU (`mediaanalysisd`), with diagnosis and verification |
+| [docs/flutter-shaders.md](docs/flutter-shaders.md) | Flutter Impeller pipeline/gradient fixes and a shader investigation guide |
+| [patches/flutter-shaders/](patches/flutter-shaders/) | Combined metal2vulkan patch, exact source pins and checksum |
 | [scripts/check](scripts/check) | Local packaging tests and syntax checks; no VM or privileged changes |
 | [archive/](archive/) | A usbmux relay approach that did **not** work, kept for reference |
 

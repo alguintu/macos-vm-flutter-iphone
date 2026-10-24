@@ -185,8 +185,13 @@ Not yet verified on the reference machine: a host reboot (USB bus numbering), an
 
 Do not repeat these without new evidence.
 
+Flutter Simulator pipeline rejection and black gradients have a separate
+[shader fix and investigation guide](docs/flutter-shaders.md). Both local fixes
+are packaged; full shader compatibility and upstream CI remain unverified.
+
 | Tried | Result |
 | --- | --- |
+| Flutter Impeller on the pinned stock metal2vulkan | Debug-info module flags reject pipelines; after fixing that, dynamic gradient-stop reads are bounded too narrowly. Apply both [shader fixes](docs/flutter-shaders.md), then verify logs and pixels |
 | Bare-metal Hackintosh | Abandoned: AMD kernel patches, board SSDTs and USB mapping, plus a reboot to switch OS |
 | OSX-KVM graphics (`vmware-svga`) | Unaccelerated; macOS has no driver for virtio-gpu, QXL or VMware SVGA |
 | Single-GPU passthrough | Blanks the host desktop while the VM runs |
